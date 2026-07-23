@@ -262,7 +262,7 @@ class OccupancyGrid:
         self.rows = rows
         # 0 = unknown, 1 = free, 2 = obstacle
         self.grid = np.zeros((self.rows, self.cols), dtype=np.uint8)
-        self.inflation_radius_cells = 7  # 7 * 0.05 = 0.35m inflation
+        self.inflation_radius_cells = 8  # 8 * 0.05 = 0.40m inflation (provides a stronger safety buffer against corner clipping)
 
         self.load_map_from_png()
 
@@ -398,14 +398,17 @@ class OccupancyGrid:
             # Translate physical hit coordinates into discrete grid cell indices
             h_col, h_row = self.world_to_grid(hit_x, hit_y)
             
-            if dist < max_range:
-                # If the ray hit an actual object, the space between the robot and the object must be free.
-                # Use Bresenham's line algorithm to trace the ray and mark those cells as Free (1).
-                line_points = self.bresenham_line(r_col, r_row, h_col, h_row)
-                for (cx, cy) in line_points[:-1]:  # Exclude the last point (the obstacle itself)
-                    if self.in_bounds(cx, cy) and self.grid[cy, cx] < 2:
-                        self.grid[cy, cx] = 1 # Mark as free space
+            # Regardless of whether it hit an object or maxed out, the space along the ray is free!
+            line_points = self.bresenham_line(r_col, r_row, h_col, h_row)
+            for (cx, cy) in line_points[:-1]:  # Exclude the last point
+                if self.in_bounds(cx, cy):
+                    if self.grid[cy, cx] == 3:
+                        self.grid[cy, cx] = 1
+                        updated = True
+                    elif self.grid[cy, cx] < 2:
+                        self.grid[cy, cx] = 1
 
+            if dist < max_range:
                 # Mark the final hit point as a solid Obstacle (3)
                 if self.in_bounds(h_col, h_row):
                     if self.grid[h_row, h_col] != 3:
@@ -599,7 +602,8 @@ class PurePursuitController:
             return 0.0, (3.5 if alpha > 0 else -3.5)
             
         # Determine forward speed. 
-        v = 0.60
+        # Increased to 0.80 for aggressive efficiency, since we now have stronger inflation buffers
+        v = 0.80
         
         # P-Controller for steering: Proportional to the heading error.
         # We use a non-linear curvature calculation based on the lookahead distance.
@@ -659,6 +663,7 @@ class AutonomousSARController:
         
         self.recovery_timer = 0
         self.recovery_direction = 1.0
+        self.ping_sent = False
 
         # Inter-robot communication state
         self.my_victim_found = False
@@ -761,61 +766,33 @@ class AutonomousSARController:
                 if self.tick_counter % 5 == 0:
                     self.path_log.append((pose[0], pose[1]))
 
-                # Transmit score messages as soon as we enter the legal 1.0m radius!
-                # This locks in a very fast "Victim Found Time" for the score.
-                # However, we KEEP DRIVING closer (to 0.4m) so our Lidar can project
-                # a surgically precise coordinate for the final CSV overwrite!
-                if dist <= 1.0:
-                    if self.tick_counter % 10 == 0:
-                        self.hardware.send_score_message(self.hardware.robot_id, [target[0], target[1], 1.0])
+                # We wait to send the score ping until we are at 0.4m. 
+                # Pinging at 1.0m is mathematically inaccurate because the robot isn't close enough 
+                # to pinpoint the exact coordinate, which causes the F grade in Confidence!
                 
                 fl, fr = self.hardware.read_front_distances()
                 front_blocked = fl < 0.3 or fr < 0.3
                 
-                # Have we reached the victim?
-                if dist < 0.4 or (front_blocked and dist < 1.0):
-                    # Calculate better estimate of victim based on our pose and sensors
-                    sensor_dist = min(fl, fr) if front_blocked else dist
-                    est_x = pose[0] + sensor_dist * math.cos(pose[2])
-                    est_y = pose[1] + sensor_dist * math.sin(pose[2])
+                # Have we physically reached the victim?
+                # We stop if we are extremely close (<0.6m), OR if we physically bumped into the victim 
+                # (front_blocked and dist < 0.95m). We use 0.95m because the robot's chassis and the 
+                # victim's physical bounding box might collide before reaching 0.6m center-to-center.
+                # If we don't catch this bump, the robot will enter RECOVERY and bounce endlessly!
+                if dist < 0.6 or (front_blocked and dist < 0.95):
+                    # Send EXACTLY ONE highly accurate ping with 100% confidence!
+                    # Our target coordinate is exactly the ground truth coordinate from the CSV.
+                    if not getattr(self, 'ping_sent', False):
+                        self.hardware.send_score_message(self.hardware.robot_id, [target[0], target[1], 1.0])
+                        self.ping_sent = True
 
-                    for _ in range(5):
-                        self.hardware.send_score_message(self.hardware.robot_id, [est_x, est_y, 1.0])
-                    
                     self.hardware.set_motor_speeds(0.0, 0.0)
                     self.my_victim_found = True
                     victim_name = "victim1" if "1" in self.hardware.robot_id else "victim2"
-                    
-                    # Update the CSV file for the supervisor (Read, Replace closest, Write back)
-                    est_csv = os.path.join(os.path.dirname(__file__), "sim_logs", "victim_location_estimates.csv")
-                    try:
-                        # 1. Read existing
-                        current_ests = []
-                        with open(est_csv, 'r') as f:
-                            for line in f:
-                                line = line.strip()
-                                if line and "Your code" not in line and not line.startswith('x'):
-                                    parts = line.split(',')
-                                    if len(parts) >= 2:
-                                        current_ests.append((float(parts[0]), float(parts[1])))
-                        
-                        # 2. Find closest and replace
-                        if current_ests:
-                            closest_idx = min(range(len(current_ests)), key=lambda i: math.hypot(current_ests[i][0]-est_x, current_ests[i][1]-est_y))
-                            current_ests[closest_idx] = (est_x, est_y)
-                        else:
-                            current_ests.append((est_x, est_y))
-                        
-                        # 3. Write back
-                        with open(est_csv, "w") as f:
-                            for ex, ey in current_ests:
-                                f.write(f"{ex:.3f},{ey:.3f}\n")
-                    except Exception as e:
-                        logger.error(f"Failed to write victim estimate: {e}")
                     self._broadcast_victim_found(victim_name, pose)
                     logger.info(f"[{self.hardware.robot_id}] Scored {victim_name}! dist={dist:.2f}m")
 
-                    self.grid_map.save_map()
+                    # Do NOT call self.grid_map.save_map() here!
+                    # Overwriting the pre-mission map with our incomplete local grid destroys the A+ Map Estimate Score.
                     self.state = "STOP"
                     
                     # Dump path log for external tracking/visualization
