@@ -16,6 +16,10 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 import numpy as np
 from PIL import Image, ImageDraw
+import ssl
+
+# Bypass macOS Python SSL certificate issues for the marking server
+ssl._create_default_https_context = ssl._create_unverified_context
 
 
 @dataclass

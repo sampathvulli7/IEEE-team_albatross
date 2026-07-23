@@ -1,0 +1,459 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/Floor.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/appearances/protos/Parquetry.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/lights/protos/CeilingSpotLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/lights/protos/CeilingLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/apartment_structure/protos/Wall.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/appearances/protos/Roughcast.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/apartment_structure/protos/Window.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/appearances/protos/MattePaint.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/apartment_structure/protos/Door.proto"
+EXTERNPROTO "../protos/Rosbot.proto"
+EXTERNPROTO "../protos/OriginMarker.proto"
+EXTERNPROTO "../protos/Victim.proto"
+
+WorldInfo {
+  info [
+    "A basic search and rescue example world"
+  ]
+  title "Basic SAR example"
+  basicTimeStep 16
+  FPS 30
+}
+Viewpoint {
+  orientation -0.5754161189814868 0.5754161353340281 0.5811992439891287 2.088636151886481
+  position 2.0429663642915097 1.2755482093401707 31.94047705430872
+  exposure 0.5
+  ambientOcclusionRadius 1
+}
+TexturedBackground {
+  texture "entrance_hall"
+  luminosity 0.5
+  skybox FALSE
+}
+TexturedBackgroundLight {
+  texture "entrance_hall"
+}
+Floor {
+  translation 0.243 0.93 0
+  rotation 0 0 1 1.5708
+  size 7.7 12.86
+  appearance Parquetry {
+    type "light strip"
+    textureTransform TextureTransform {
+      rotation 1.57
+      scale 0.4 0.4
+    }
+  }
+}
+CeilingSpotLight {
+  translation -1.82 -2.27 2
+  name "ceiling spot light"
+  spotLightColor 0.913725 0.72549 0.431373
+  spotLightIntensity 4
+}
+CeilingLight {
+  translation 4.78 -0.87 2.5
+  bulbColor 0.913725 0.72549 0.431373
+  supportColor 0.533333 0.541176 0.521569
+  pointLightColor 0.913725 0.72549 0.431373
+  pointLightIntensity 3
+}
+CeilingLight {
+  translation 4.78 2.74 2.5
+  name "ceiling light(5)"
+  bulbColor 0.913725 0.72549 0.431373
+  supportColor 0.533333 0.541176 0.521569
+  pointLightColor 0.913725 0.72549 0.431373
+  pointLightIntensity 3
+}
+CeilingLight {
+  translation 0.31 -0.87 2.5
+  name "ceiling light(1)"
+  bulbColor 0.913725 0.72549 0.431373
+  supportColor 0.533333 0.541176 0.521569
+  pointLightColor 0.913725 0.72549 0.431373
+  pointLightIntensity 3
+}
+CeilingLight {
+  translation 0.31 2.74 2.5
+  name "ceiling light(4)"
+  bulbColor 0.913725 0.72549 0.431373
+  supportColor 0.533333 0.541176 0.521569
+  pointLightColor 0.913725 0.72549 0.431373
+  pointLightIntensity 3
+}
+CeilingLight {
+  translation -3.52 -0.87 2.5
+  name "ceiling light(2)"
+  bulbColor 0.913725 0.72549 0.431373
+  supportColor 0.533333 0.541176 0.521569
+  pointLightColor 0.913725 0.72549 0.431373
+  pointLightIntensity 3
+}
+CeilingLight {
+  translation -3.52 2.74 2.5
+  name "ceiling light(3)"
+  bulbColor 0.913725 0.72549 0.431373
+  supportColor 0.533333 0.541176 0.521569
+  pointLightColor 0.913725 0.72549 0.431373
+  pointLightIntensity 3
+}
+Wall {
+  translation -6.17 0.95 0
+  name "wall(A)"
+  size 0.2 7.9 2.5
+  appearance DEF SIDE_WALLS Roughcast {
+    textureTransform TextureTransform {
+      scale 3 3
+    }
+  }
+}
+Wall {
+  translation -5.94 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "wall(B)1"
+  size 0.2 0.4 2.5
+  appearance DEF INTER_WALLS Roughcast {
+    textureTransform TextureTransform {
+      scale 0.3 2.2
+    }
+  }
+}
+Window {
+  translation -5.19 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "window(B)2"
+  size 0.2 1.1 2.5
+  bottomWallHeight 1
+  frameSize 0.02 0.05 0.02
+  windowSillSize 0.3 0.05
+  frameAppearance DEF WINDOWS_WOOD MattePaint {
+    baseColor 0.133333 0.0666667 0
+  }
+}
+Window {
+  translation -3.84 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "window(B)3"
+  size 0.2 1.6 2.5
+  bottomWallHeight 1
+  frameSize 0.02 0.05 0.02
+  windowSillSize 0.3 0.05
+  frameAppearance USE WINDOWS_WOOD
+}
+Wall {
+  translation -2.84 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "wall(B)4"
+  size 0.2 0.4 2.5
+  appearance USE INTER_WALLS
+}
+Window {
+  translation -2.09 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "window(B)5"
+  size 0.2 1.1 2.5
+  bottomWallHeight 1
+  frameSize 0.02 0.05 0.02
+  windowSillSize 0.3 0.05
+  frameAppearance USE WINDOWS_WOOD
+}
+Window {
+  translation -0.74 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "window(B)6"
+  size 0.2 1.6 2.5
+  bottomWallHeight 1
+  frameSize 0.02 0.05 0.02
+  windowSillSize 0.3 0.05
+  frameAppearance USE WINDOWS_WOOD
+}
+Wall {
+  translation 0.26 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "wall(B)7"
+  size 0.2 0.4 2.5
+  appearance USE INTER_WALLS
+}
+Window {
+  translation 1 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "window(B)8"
+  size 0.2 1.1 2.5
+  bottomWallHeight 1
+  frameSize 0.02 0.05 0.02
+  windowSillSize 0.3 0.05
+  frameAppearance USE WINDOWS_WOOD
+}
+Window {
+  translation 2.35 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "window(B)9"
+  size 0.2 1.6 2.5
+  bottomWallHeight 1
+  frameSize 0.02 0.05 0.02
+  windowSillSize 0.3 0.05
+  frameAppearance USE WINDOWS_WOOD
+}
+Wall {
+  translation 3.35 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "wall(B)10"
+  size 0.2 0.4 2.5
+  appearance USE INTER_WALLS
+}
+Window {
+  translation 4.1 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "window(B)11"
+  size 0.2 1.1 2.5
+  bottomWallHeight 1
+  frameSize 0.02 0.05 0.02
+  windowSillSize 0.3 0.05
+  frameAppearance USE WINDOWS_WOOD
+}
+Window {
+  translation 5.45 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "window(B)12"
+  size 0.2 1.6 2.5
+  bottomWallHeight 1
+  frameSize 0.02 0.05 0.02
+  windowSillSize 0.3 0.05
+  frameAppearance USE WINDOWS_WOOD
+}
+Wall {
+  translation 6.45 -2.9 0
+  rotation 0 0 1 -1.5708003061004252
+  name "wall(B)13"
+  size 0.2 0.4 2.5
+  appearance USE INTER_WALLS
+}
+Wall {
+  translation 6.68 0.95 0
+  name "wall(C)"
+  size 0.2 7.9 2.5
+  appearance USE SIDE_WALLS
+}
+Wall {
+  translation 3.6 4.8 0
+  rotation 0 0 1 -1.5708003061004252
+  name "wall(D)1"
+  size 0.2 6.2 2.5
+}
+Door {
+  hidden translation_5 0.001071034429286133 1.629494123062125e-05 1.1102230246251565e-16
+  hidden rotation_5 0 0 -1 0.00014954360236675156
+  translation 0 4.8 0
+  rotation 0 0 -1 1.5708
+  size 0.2 1 2.5
+  position -0.00014954360158241613
+  frameSize 0.01 0.05 0.05
+  frameAppearance MattePaint {
+    baseColor 0.133333 0.0666667 0
+  }
+}
+Wall {
+  translation -3.35 4.8 0
+  rotation 0 0 1 -1.5708003061004252
+  name "wall(D)2"
+  size 0.2 5.7 2.5
+}
+Robot {
+  children [
+    Receiver {
+      channel 43
+      allowedChannels [
+        43
+      ]
+    }
+  ]
+  name "sar_marking_supervisor"
+  controller "sar_marking_supervisor"
+  supervisor TRUE
+}
+Solid {
+  translation 2.5 2 0.299019000000087
+  rotation -0.9712975028322637 0.10406758958917102 0.21389506256318427 1.0924326985031451e-17
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.6 0.4 0.2
+        roughness 0.8
+      }
+      geometry Box {
+        size 0.6 0.6 0.6
+      }
+    }
+  ]
+  name "obstacle1"
+  boundingObject Box {
+    size 0.6 0.6 0.6
+  }
+  physics Physics {
+    mass 5
+  }
+  linearVelocity -1.3970829809678774e-17 6.8608540470156935e-18 -1.3947783373093846e-12
+  angularVelocity -4.736951571734002e-17 -4.736951571734002e-17 1.0612156036926002e-17
+}
+Solid {
+  translation -2 1.9711538529436325e-17 0.299019000000087
+  rotation -0.9191984088482252 -0.3933346027116215 0.019030908559020357 6.520593513304645e-17
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.6 0.4 0.2
+        roughness 0.8
+      }
+      geometry Box {
+        size 0.8 0.5 0.6
+      }
+    }
+  ]
+  name "obstacle2"
+  boundingObject Box {
+    size 0.8 0.5 0.6
+  }
+  physics Physics {
+    mass 5
+  }
+  linearVelocity -3.678620812304856e-18 2.3219419786428887e-17 -1.3947783373062851e-12
+  angularVelocity -5.591155953522096e-17 -3.4106051316484775e-17 5.548864270891572e-18
+}
+Solid {
+  translation 4 3.5 0.299019000000087
+  rotation -0.0237171505277487 0.9997167753192431 0.001966193311500901 5.413772276934212e-17
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.6 0.4 0.2
+        roughness 0.8
+      }
+      geometry Box {
+        size 0.5 0.7 0.6
+      }
+    }
+  ]
+  name "obstacle3"
+  boundingObject Box {
+    size 0.5 0.7 0.6
+  }
+  physics Physics {
+    mass 5
+  }
+  linearVelocity 4.5536674309234275e-18 1.6194430896832813e-17 -1.3947328627331572e-12
+  angularVelocity -8.024953250937601e-17 2.7955779767610487e-17 1.3100815473522377e-18
+}
+Solid {
+  translation -4 -1 0.299019000000087
+  rotation 0.7763481656838738 -0.6303042980335396 0.0001323621226191879 5.703878376899071e-17
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.6 0.4 0.2
+        roughness 0.8
+      }
+      geometry Box {
+        size 0.7 0.5 0.6
+      }
+    }
+  ]
+  name "obstacle4"
+  boundingObject Box {
+    size 0.7 0.5 0.6
+  }
+  physics Physics {
+    mass 5
+  }
+  linearVelocity 1.9582305809144557e-19 -1.7569614965569697e-17 -1.3947556000306625e-12
+  angularVelocity 5.59115595352211e-17 -1.9721522630525295e-31 6.452516803700868e-18
+}
+Solid {
+  translation -7.93775089915485e-18 -9.671699022332775e-18 0.299019000000087
+  rotation 0.7942447431342965 -0.6073636271026979 0.016873425146965666 4.0555850027633984e-17
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.6 0.4 0.2
+        roughness 0.8
+      }
+      geometry Box {
+        size 0.6 0.6 0.6
+      }
+    }
+  ]
+  name "obstacle5"
+  boundingObject Box {
+    size 0.6 0.6 0.6
+  }
+  physics Physics {
+    mass 5
+  }
+  linearVelocity -5.689894851049102e-18 -3.371423046738592e-17 -1.3948010747403245e-12
+  angularVelocity 1.4210854715202004e-16 0 5.022162207173484e-18
+}
+Victim {
+  translation 5.53 4.53 0
+  rotation 0 0 -1 0
+  name "victim1"
+  model "man_1"
+}
+Victim {
+  translation -5.88901 -1.6474 0
+  rotation 0 0 -1 -1.5708
+  name "victim2"
+  model "woman_3"
+}
+OriginMarker {
+  hidden position_0_0 25.26392847631973
+  hidden position_0_1 25.351239029836737
+  hidden position_0_2 25.263926917738868
+  hidden position_0_3 25.351237118660123
+  hidden linearVelocity_0 0.32923435978002785 0.009683566474289184 0.00014480450821624662
+  hidden angularVelocity_0 -0.0030484489801253004 0.010432191304214335 1.6298344494845802
+  hidden rotation_2 0 1 0 0.13118724760138512
+  hidden linearVelocity_2 0.15625440609876332 0.06740093847707146 -0.0005036005547675897
+  hidden angularVelocity_2 -0.4720012724725381 2.9800197863621136 1.624231726083455
+  hidden rotation_3 0 1 0 0.218497801118391
+  hidden linearVelocity_3 0.4738365142283915 0.11921800709833788 -0.0005998031037641513
+  hidden angularVelocity_3 -1.8904560174795138 11.854261476758714 1.6883758526363701
+  hidden rotation_4 0 1 0 0.13118568902052327
+  hidden linearVelocity_4 0.183788352196427 -0.1015682352994074 0.0006062832078863635
+  hidden angularVelocity_4 -0.47199960943487507 2.9800211232972176 1.6242320661172363
+  hidden rotation_5 0 0.9999999999999999 0 0.21849588994177788
+  hidden linearVelocity_5 0.5013288331645069 -0.049750589839978446 0.000510381962816504
+  hidden angularVelocity_5 -1.890453749977127 11.85426311499311 1.6883777357316465
+  hidden position_21_0 -1.9342814461253965e-08
+  hidden position_21_1 -1.9389640115718976e-08
+  hidden position_21_2 -1.8967228676558534e-08
+  hidden position_21_3 -1.901406410098616e-08
+  hidden linearVelocity_21 2.0871391307068627e-15 2.0656364366806524e-15 -1.3374922084896002e-16
+  hidden angularVelocity_21 -8.988426227501233e-16 2.0002636191170016e-16 -2.791481745880738e-17
+  hidden linearVelocity_23 -2.3711238065630495e-16 -4.917635566937333e-15 1.1368762833597297e-16
+  hidden angularVelocity_23 7.869271278588596e-16 -9.223812470580501e-18 6.248201437969324e-17
+  hidden linearVelocity_24 2.3783153225788565e-16 4.855889672761002e-15 -8.526671188241658e-17
+  hidden angularVelocity_24 -7.869270918996791e-16 5.3914584708643726e-17 1.6133600983245808e-16
+  hidden linearVelocity_25 2.3185129390814006e-16 -4.903500985599297e-15 2.842193905786983e-17
+  hidden angularVelocity_25 3.934635048376848e-16 -6.752146439034541e-17 4.113881454167436e-17
+  hidden linearVelocity_26 -2.3408995126556115e-16 4.7903488582949076e-15 8.526511947149477e-17
+  hidden angularVelocity_26 1.5738541944464316e-15 6.882892955345204e-20 -8.354463265183571e-17
+  translation 1 1 0.002
+  children [
+    Rosbot {
+      translation 0.8151269731178055 0.8335605837916404 -0.002260822077969694
+      rotation -4.811201625111538e-05 -0.004368845314408037 0.9999904553923765 0.17646099396647327
+      name "robot1"
+      controller "proposed_solution"
+    }
+    Rosbot {
+      translation -0.3749999972811814 2.524647157997606e-13 -0.0022812925734302363
+      rotation 0.006951307264090439 0.9999758393717876 -9.547085012655268e-08 1.5863589609311783e-05
+      name "robot2"
+      controller "proposed_solution"
+    }
+  ]
+}
