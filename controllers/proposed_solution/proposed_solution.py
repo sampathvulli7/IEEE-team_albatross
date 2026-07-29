@@ -296,15 +296,25 @@ class OccupancyGrid:
       1 = Free space (confirmed by map or lidar)
       2 = Inflated safety buffer (around obstacles)
       3 = Solid obstacle (wall/object)
+    
+    COORDINATE SYSTEM:
+      The map uses the supervisor's Y-flipped coordinate mapping:
+        col = int((world_x - world_min_x) / resolution)
+        row = int((world_max_y - world_y) / resolution)
+      This matches the ground truth map pixel-for-pixel.
     """
-    def __init__(self, rows: int = 600, cols: int = 600, resolution: float = 0.05):
+    def __init__(self, rows: int = 1000, cols: int = 1000, resolution: float = 0.05):
         self.resolution = resolution
-        self.origin_x = -15.0  # World coordinate of grid cell (0,0)
-        self.origin_y = -15.0
+        # Default world bounds (overridden by map_metadata.json if available)
+        self.world_min_x = -25.0
+        self.world_max_y = 25.0
         self.cols = cols
         self.rows = rows
         # Inflation radius in grid cells (3 cells * 0.05m = 0.15m clearance)
         self.inflation_radius_cells = 3
+        
+        # Load map metadata first to get correct coordinate system
+        self._load_map_metadata()
         
         # Combined grid used by A* planner
         self.grid = np.zeros((self.rows, self.cols), dtype=np.uint8)
@@ -312,6 +322,23 @@ class OccupancyGrid:
         self.static_grid = np.zeros((self.rows, self.cols), dtype=np.uint8)
         
         self.load_map_from_png()
+
+    def _load_map_metadata(self):
+        """Load map coordinate metadata from map_metadata.json."""
+        meta_path = os.path.join(os.path.dirname(__file__), "sim_logs", "map_metadata.json")
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+                self.cols = meta.get("width", self.cols)
+                self.rows = meta.get("height", self.rows)
+                self.resolution = meta.get("resolution", self.resolution)
+                self.world_min_x = meta.get("world_min_x", self.world_min_x)
+                self.world_max_y = meta.get("world_max_y", self.world_max_y)
+                logger.info(f"Map metadata: {self.cols}x{self.rows}, "
+                           f"world_min_x={self.world_min_x:.2f}, world_max_y={self.world_max_y:.2f}")
+            except Exception as e:
+                logger.error(f"Failed to load map metadata: {e}")
 
     def load_map_from_png(self):
         """
@@ -326,8 +353,8 @@ class OccupancyGrid:
 
         try:
             img = Image.open(map_path).convert('L')
-            if img.size != (600, 600):
-                img = img.resize((600, 600))
+            if img.size != (self.cols, self.rows):
+                img = img.resize((self.cols, self.rows))
             pixels = np.array(img)
 
             # Threshold: < 128 is wall (black), >= 128 is free (white)
@@ -338,7 +365,6 @@ class OccupancyGrid:
             self.static_grid = np.copy(self.grid)
 
             # Inflate walls: add safety buffer cells around every wall cell
-            # Uses scipy-style binary dilation via manual circle kernel
             wall_mask = (self.grid == 3)
             r = self.inflation_radius_cells
             for row in range(self.rows):
@@ -357,15 +383,17 @@ class OccupancyGrid:
             logger.error(f"Failed to load map PNG: {e}")
 
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
-        """Convert world coordinates (meters) to grid cell indices (col, row)."""
-        col = int((x - self.origin_x) / self.resolution)
-        row = int((y - self.origin_y) / self.resolution)
+        """Convert world coordinates (meters) to grid cell indices (col, row).
+        Uses the supervisor's Y-flipped coordinate mapping."""
+        col = int((x - self.world_min_x) / self.resolution)
+        row = int((self.world_max_y - y) / self.resolution)
         return col, row
 
     def grid_to_world(self, col: int, row: int) -> Coordinate:
-        """Convert grid cell indices back to world coordinates (meters)."""
-        x = (col + 0.5) * self.resolution + self.origin_x
-        y = (row + 0.5) * self.resolution + self.origin_y
+        """Convert grid cell indices back to world coordinates (meters).
+        Inverse of world_to_grid with Y-flip."""
+        x = (col + 0.5) * self.resolution + self.world_min_x
+        y = self.world_max_y - (row + 0.5) * self.resolution
         return x, y
 
     def in_bounds(self, col: int, row: int) -> bool:

@@ -40,7 +40,8 @@ def parse_wbt(filepath):
             match = re.match(r'^([A-Za-z0-9_]+)\s*\{', line)
             if match:
                 current_type = match.group(1)
-                current_node = {'type': current_type, 'translation': [0,0,0], 'rotation': [0,0,1,0], 'size': [0,0,0]}
+                default_rot = [0, 0, 1, 1.5708] if current_type == 'Victim' else [0, 0, 1, 0]
+                current_node = {'type': current_type, 'translation': [0,0,0], 'rotation': default_rot, 'size': [0,0,0]}
                 brace_count += line.count('{') - line.count('}')
                 if brace_count == 0:
                     if current_type in ['Wall', 'Window', 'Door', 'Victim']:
