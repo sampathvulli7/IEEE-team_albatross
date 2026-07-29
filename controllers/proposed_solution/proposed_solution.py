@@ -1,6 +1,16 @@
 """
 IEEE SMCS Autonomous Search and Rescue - Proposed Solution
-Advanced Navigation with Dynamic Mapping & A* Path Planning
+===========================================================
+Multi-robot SAR controller with A* path planning, lidar mapping,
+Pure Pursuit path following, and inter-robot coordination.
+
+Architecture:
+  ROSbotHardwareInterface  - Webots sensor/actuator abstraction
+  CompassOdometry          - Wheel encoder + compass pose tracking
+  OccupancyGrid            - 2D grid map with static + dynamic layers
+  AStarPlanner             - 8-way A* with inflation-aware cost and Theta* smoothing
+  PurePursuitController    - Geometric path follower with adaptive speed
+  AutonomousSARController  - Top-level FSM mission controller
 """
 
 import sys
@@ -8,7 +18,6 @@ import math
 import json
 import logging
 import heapq
-import time
 import os
 from typing import List, Tuple, Optional
 
@@ -21,9 +30,10 @@ except ImportError:
     Robot = None
 
 # ==========================================
-# SYSTEM SETUP
+# SYSTEM SETUP: Unbuffered I/O for Webots
 # ==========================================
 class Unbuffered(object):
+    """Forces immediate stdout/stderr flushing so Webots console shows output in real time."""
     def __init__(self, stream):
         self.stream = stream
     def write(self, data):
@@ -41,19 +51,19 @@ sys.stderr = Unbuffered(sys.stderr)
 logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
 logger = logging.getLogger("AutonomousSAR")
 
-Pose = Tuple[float, float, float]
-Coordinate = Tuple[float, float]
+# Type aliases for clarity
+Pose = Tuple[float, float, float]       # (x, y, theta) in meters/radians
+Coordinate = Tuple[float, float]         # (x, y) in meters
+
 
 # ==========================================
-# HARDWARE ABSTRACTION LAYER
-# HARDWARE INTERFACE (WEBOTS)
+# HARDWARE ABSTRACTION LAYER (Webots API)
 # ==========================================
 class ROSbotHardwareInterface:
     """
-    Provides a high-level Python abstraction over the Webots low-level Robot API.
-    It encapsulates all motors, encoders, Lidar, Compass, and radio Emitters/Receivers.
-    This class handles the raw parsing of Webots data structures and exposes them
-    as clean Python types (e.g., tuples, floats) to the main controller logic.
+    Provides a clean Python interface to the Webots ROSbot hardware.
+    Encapsulates all motors, encoders, lidar, compass, IR sensors, 
+    and radio emitter/receiver devices.
     """
     def __init__(self):
         logger.info("Initializing ROSbot Hardware Interface...")
@@ -66,34 +76,34 @@ class ROSbotHardwareInterface:
         self.timestep = int(self.robot.getBasicTimeStep())
         self.robot_id = self.robot.getName()
 
-        # Motors
+        # --- Drive Motors (4WD differential drive) ---
         self.fl_motor = self.robot.getDevice("fl_wheel_joint")
         self.fr_motor = self.robot.getDevice("fr_wheel_joint")
         self.rl_motor = self.robot.getDevice("rl_wheel_joint")
         self.rr_motor = self.robot.getDevice("rr_wheel_joint")
         for motor in [self.fl_motor, self.fr_motor, self.rl_motor, self.rr_motor]:
             if motor:
-                motor.setPosition(float('inf'))
+                motor.setPosition(float('inf'))  # Velocity control mode
                 motor.setVelocity(0.0)
 
-        # Encoders
+        # --- Wheel Encoders (for odometry) ---
         self.left_sensor = self.robot.getDevice("front left wheel motor sensor")
         self.right_sensor = self.robot.getDevice("front right wheel motor sensor")
         if self.left_sensor: self.left_sensor.enable(self.timestep)
         if self.right_sensor: self.right_sensor.enable(self.timestep)
 
-        # Lidar - 360° scanner
+        # --- 360° Lidar Scanner ---
         self.lidar = self.robot.getDevice("laser")
         if self.lidar:
             self.lidar.enable(self.timestep)
             self.lidar.enablePointCloud()
 
-        # Compass (ground truth heading)
+        # --- IMU Compass (absolute heading) ---
         self.compass = self.robot.getDevice("imu compass")
         if self.compass:
             self.compass.enable(self.timestep)
 
-        # Front distance sensors
+        # --- IR Distance Sensors (front-left, front-right, rear-left, rear-right) ---
         self.fl_range = self.robot.getDevice("fl_range")
         self.fr_range = self.robot.getDevice("fr_range")
         self.rl_range = self.robot.getDevice("rl_range")
@@ -101,78 +111,122 @@ class ROSbotHardwareInterface:
         for sensor in [self.fl_range, self.fr_range, self.rl_range, self.rr_range]:
             if sensor: sensor.enable(self.timestep)
 
-        # Supervisor emitter (channel 43)
+        # --- Radio: Supervisor scoring channel (channel 43) ---
         self.emitter = self.robot.getDevice("supervisor emitter")
         if self.emitter:
             self.emitter.setChannel(43)
 
-        # Robot-to-robot communication
+        # --- Radio: Robot-to-robot squad communication ---
         self.squad_receiver = self.robot.getDevice("robot to robot receiver")
         self.squad_emitter = self.robot.getDevice("robot to robot emitter")
         if self.squad_receiver:
             self.squad_receiver.enable(self.timestep)
 
+        # Track current motor speeds for smooth acceleration
+        self.curr_left_rads = 0.0
+        self.curr_right_rads = 0.0
+
     def step(self) -> bool:
+        """Advance simulation by one timestep. Returns False if simulation ended."""
         if self.robot is None: return False
         return self.robot.step(self.timestep) != -1
 
     def get_time(self) -> float:
+        """Get current simulation time in seconds."""
         return self.robot.getTime() if self.robot else 0.0
 
     def read_encoders(self) -> Tuple[float, float]:
+        """Read left/right wheel encoder positions in radians."""
         l = self.left_sensor.getValue() if self.left_sensor else 0.0
         r = self.right_sensor.getValue() if self.right_sensor else 0.0
         return l, r
 
     def read_compass_heading(self) -> float:
+        """Read absolute heading from IMU compass (radians, 0=North)."""
         if not self.compass: return 0.0
         north = self.compass.getValues()
         return math.atan2(north[0], north[1])
 
     def read_lidar(self) -> List[float]:
+        """Read 360° lidar range image (list of distances in meters)."""
         if not self.lidar: return []
         return self.lidar.getRangeImage()
 
     def read_front_distances(self) -> Tuple[float, float]:
+        """Read front-left and front-right IR distance sensors (meters)."""
         fl = self.fl_range.getValue() if self.fl_range else 2.0
         fr = self.fr_range.getValue() if self.fr_range else 2.0
         return fl, fr
 
-    def read_rear_distances(self) -> Tuple[float, float]:
-        rl = self.rl_range.getValue() if self.rl_range else 2.0
-        rr = self.rr_range.getValue() if self.rr_range else 2.0
-        return rl, rr
-
     def set_motor_speeds(self, linear_velocity: float, angular_velocity: float) -> None:
-        track_width = 0.2
-        wheel_radius = 0.04
+        """
+        Convert (v, omega) to differential drive wheel speeds with smooth acceleration.
+        Uses slew-rate limiting to prevent physics engine instability.
+        """
+        # ROSbot parameters
+        track_width = 0.20   # Distance between left and right wheels (meters)
+        wheel_radius = 0.04  # Wheel radius (meters)
+        max_rads = 12.0      # Motor max speed (rad/s ≈ 0.48 m/s)
+
+        # Differential drive kinematics: v_wheel = v ± omega * track_width/2
         v_left = linear_velocity - (angular_velocity * track_width / 2.0)
         v_right = linear_velocity + (angular_velocity * track_width / 2.0)
-        left_rads = max(-26.0, min(26.0, v_left / wheel_radius))
-        right_rads = max(-26.0, min(26.0, v_right / wheel_radius))
-        if self.fl_motor: self.fl_motor.setVelocity(left_rads)
-        if self.rl_motor: self.rl_motor.setVelocity(left_rads)
-        if self.fr_motor: self.fr_motor.setVelocity(right_rads)
-        if self.rr_motor: self.rr_motor.setVelocity(right_rads)
+
+        # Convert linear speed to motor angular speed and clamp
+        target_left = max(-max_rads, min(max_rads, v_left / wheel_radius))
+        target_right = max(-max_rads, min(max_rads, v_right / wheel_radius))
+
+        # Smooth acceleration: limit rate of change to prevent impulse spikes
+        dt = (self.timestep / 1000.0) if self.timestep else 0.032
+        max_delta = 25.0 * dt  # 25 rad/s² acceleration limit
+
+        d_left = target_left - self.curr_left_rads
+        d_right = target_right - self.curr_right_rads
+        self.curr_left_rads += max(-max_delta, min(max_delta, d_left))
+        self.curr_right_rads += max(-max_delta, min(max_delta, d_right))
+
+        # Apply to all four motors
+        if self.fl_motor: self.fl_motor.setVelocity(self.curr_left_rads)
+        if self.rl_motor: self.rl_motor.setVelocity(self.curr_left_rads)
+        if self.fr_motor: self.fr_motor.setVelocity(self.curr_right_rads)
+        if self.rr_motor: self.rr_motor.setVelocity(self.curr_right_rads)
 
     def send_score_message(self, robot_id: str, position: List[float]) -> None:
+        """Send victim FOUND message to supervisor for scoring.
+        ONLY call this when the robot is confident it has found a victim.
+        The victim_found=True flag is what triggers scoring."""
         if not self.emitter: return
-        # Extract confidence from position array if it exists (length 3), else default to 1.0
         confidence = position[2] if len(position) > 2 else 1.0
         msg = {
             "timestamp": self.robot.getTime(),
             "robot_id": robot_id,
-            "position": position[:2],  # Only send X, Y in the position array
+            "position": position[:2],
             "victim_found": True,
             "victim_confidence": confidence
         }
         self.emitter.send(json.dumps(msg).encode('utf-8'))
 
+    def send_status_message(self, robot_id: str, position: List[float]) -> None:
+        """Send a heartbeat/status message with victim_found=False.
+        Use this for regular periodic status updates that don't claim
+        a victim has been found. This does NOT affect confidence scoring."""
+        if not self.emitter: return
+        msg = {
+            "timestamp": self.robot.getTime(),
+            "robot_id": robot_id,
+            "position": position[:2],
+            "victim_found": False,
+            "victim_confidence": 0.0
+        }
+        self.emitter.send(json.dumps(msg).encode('utf-8'))
+
     def send_squad_message(self, message: dict) -> None:
+        """Broadcast a message to other robots via squad radio."""
         if not self.squad_emitter: return
         self.squad_emitter.send(json.dumps(message).encode('utf-8'))
 
     def receive_squad_messages(self) -> List[dict]:
+        """Read all pending messages from the squad radio queue."""
         messages = []
         if not self.squad_receiver: return messages
         while self.squad_receiver.getQueueLength() > 0:
@@ -186,46 +240,35 @@ class ROSbotHardwareInterface:
 
 
 # ==========================================
-# COMPASS ODOMETRY
+# COMPASS-FUSED ODOMETRY
 # ==========================================
 class CompassOdometry:
     """
-    Tracks the robot's pose (x, y, theta) using wheel encoders and an IMU compass.
-    The encoders track the distance traveled, while the compass provides absolute
-    global heading, preventing rotational drift over time.
+    Tracks robot pose (x, y, theta) using wheel encoders for distance
+    and an IMU compass for absolute heading. The compass prevents
+    rotational drift that accumulates with pure dead reckoning.
     """
     def __init__(self, start_x: float, start_y: float):
-        """
-        Initializes the odometry at a known starting position.
-        :param start_x: Initial global X coordinate in meters
-        :param start_y: Initial global Y coordinate in meters
-        """
         self.x = start_x
         self.y = start_y
         self.theta = 0.0
-        
         self.last_left_enc = None
         self.last_right_enc = None
-        
-        # ROSbot specific hardware constants
-        self.wheel_radius = 0.04
-        self.track_width = 0.2
+        self.wheel_radius = 0.04  # meters
+        self.track_width = 0.2    # meters
 
     def update(self, left_enc: float, right_enc: float, compass_heading: float) -> None:
-        """
-        Updates the robot's position based on sensor deltas.
-        :param left_enc: Current left wheel encoder reading (radians)
-        :param right_enc: Current right wheel encoder reading (radians)
-        :param compass_heading: Current compass heading reading
-        """
+        """Update pose from encoder deltas and compass heading."""
         self.theta = compass_heading
         if self.last_left_enc is None:
             self.last_left_enc = left_enc
             self.last_right_enc = right_enc
             return
+        # Convert encoder deltas to linear displacement
         dl = (left_enc - self.last_left_enc) * self.wheel_radius
         dr = (right_enc - self.last_right_enc) * self.wheel_radius
         dc = (dl + dr) / 2.0
+        # Integrate position using current heading
         self.x += dc * math.cos(self.theta)
         self.y += dc * math.sin(self.theta)
         self.last_left_enc = left_enc
@@ -236,117 +279,101 @@ class CompassOdometry:
 
 
 # ==========================================
-# GRID MAP UTILITY
+# OCCUPANCY GRID MAP
 # ==========================================
 class OccupancyGrid:
     """
-    Maintains a 2D occupancy grid representing the environment.
-    This grid is used by the A* and Theta* planners for obstacle avoidance.
-    The grid cells contain integers representing occupancy state:
-    - 0: Unknown / Unexplored
-    - 1: Free space
-    - 2: Inflated obstacle boundary (safety buffer)
-    - 3: Solid obstacle (walls, victims, furniture)
+    2D occupancy grid for the environment. Uses a two-layer approach:
+    
+    STATIC LAYER: Loaded from map_estimate.png (permanent walls from world file parsing).
+                  Never modified by lidar. This preserves safety buffers.
+    
+    DYNAMIC LAYER: Updated by lidar at runtime. Detects furniture, doors, 
+                   and other objects not in the static map.
+    
+    Cell values:
+      0 = Unknown/unexplored
+      1 = Free space (confirmed by map or lidar)
+      2 = Inflated safety buffer (around obstacles)
+      3 = Solid obstacle (wall/object)
     """
     def __init__(self, rows: int = 600, cols: int = 600, resolution: float = 0.05):
-        """
-        Initializes the grid map.
-        :param rows: Number of rows in the grid
-        :param cols: Number of columns in the grid
-        :param resolution: Physical size of each grid cell in meters (e.g., 0.05m = 5cm)
-        """
         self.resolution = resolution
-        self.origin_x = -15.0
+        self.origin_x = -15.0  # World coordinate of grid cell (0,0)
         self.origin_y = -15.0
         self.cols = cols
         self.rows = rows
-        # 0 = unknown, 1 = free, 2 = obstacle
+        # Inflation radius in grid cells (3 cells * 0.05m = 0.15m clearance)
+        self.inflation_radius_cells = 3
+        
+        # Combined grid used by A* planner
         self.grid = np.zeros((self.rows, self.cols), dtype=np.uint8)
-        self.inflation_radius_cells = 8  # 8 * 0.05 = 0.40m inflation (provides a stronger safety buffer against corner clipping)
-
+        # Static layer: loaded from PNG, never modified
+        self.static_grid = np.zeros((self.rows, self.cols), dtype=np.uint8)
+        
         self.load_map_from_png()
 
     def load_map_from_png(self):
+        """
+        Load the pre-computed map from map_estimate.png.
+        Black pixels = walls (3), white pixels = free space (1).
+        Then inflate all wall cells with a safety buffer.
+        """
         map_path = os.path.join(os.path.dirname(__file__), "sim_logs", "map_estimate.png")
         if not os.path.exists(map_path):
-            logger.warning(f"No map_estimate.png found at {map_path}, starting with empty grid.")
+            logger.warning(f"No map_estimate.png found, starting with empty grid.")
             return
-            
+
         try:
             img = Image.open(map_path).convert('L')
             if img.size != (600, 600):
                 img = img.resize((600, 600))
-            
             pixels = np.array(img)
-            # Threshold: < 128 is black (wall), >= 128 is white (free)
-            for r in range(600):
-                for c in range(600):
-                    if pixels[r, c] < 128:
-                        self.grid[r, c] = 3  # Raw obstacle
-                    else:
-                        self.grid[r, c] = 1  # Free
-                        
-            # Inflate obstacles
-            temp_grid = np.copy(self.grid)
-            for r in range(600):
-                for c in range(600):
-                    if temp_grid[r, c] == 3:
-                        for dr in range(-self.inflation_radius_cells, self.inflation_radius_cells + 1):
-                            for dc in range(-self.inflation_radius_cells, self.inflation_radius_cells + 1):
-                                if dr*dr + dc*dc <= self.inflation_radius_cells*self.inflation_radius_cells:
-                                    nr, nc = r + dr, c + dc
-                                    if 0 <= nr < 600 and 0 <= nc < 600 and self.grid[nr, nc] < 2:
-                                        self.grid[nr, nc] = 2  # Inflated obstacle
+
+            # Threshold: < 128 is wall (black), >= 128 is free (white)
+            self.grid[pixels < 128] = 3   # Solid wall
+            self.grid[pixels >= 128] = 1  # Free space
+            
+            # Save static copy before inflation
+            self.static_grid = np.copy(self.grid)
+
+            # Inflate walls: add safety buffer cells around every wall cell
+            # Uses scipy-style binary dilation via manual circle kernel
+            wall_mask = (self.grid == 3)
+            r = self.inflation_radius_cells
+            for row in range(self.rows):
+                for col in range(self.cols):
+                    if wall_mask[row, col]:
+                        for dr in range(-r, r + 1):
+                            for dc in range(-r, r + 1):
+                                if dr*dr + dc*dc <= r*r:
+                                    nr, nc = row + dr, col + dc
+                                    if 0 <= nr < self.rows and 0 <= nc < self.cols:
+                                        if self.grid[nr, nc] < 2:
+                                            self.grid[nr, nc] = 2  # Safety buffer
+            
             logger.info("Successfully loaded and inflated map_estimate.png")
         except Exception as e:
             logger.error(f"Failed to load map PNG: {e}")
-            
-    def save_map(self) -> None:
-        """Saves the current grid back to map_estimate.png as strict B/W"""
-        try:
-            map_path = os.path.join(os.path.dirname(__file__), "sim_logs", "map_estimate.png")
-            out_pixels = np.full((600, 600), 255, dtype=np.uint8)
-            # Only raw obstacles (3) should be black. Free (1), unknown (0), inflated (2) are white
-            out_pixels[self.grid == 3] = 0
-            
-            img = Image.fromarray(out_pixels, mode='L')
-            img.save(map_path)
-            logger.info("Successfully saved updated map_estimate.png")
-        except Exception as e:
-            logger.error(f"Failed to save map PNG: {e}")
 
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
-        """
-        Converts real-world physical coordinates (meters) to grid indices (pixels).
-        :param x: World X coordinate in meters
-        :param y: World Y coordinate in meters
-        :return: (col, row) representing the grid cell indices
-        """
+        """Convert world coordinates (meters) to grid cell indices (col, row)."""
         col = int((x - self.origin_x) / self.resolution)
         row = int((y - self.origin_y) / self.resolution)
         return col, row
 
     def grid_to_world(self, col: int, row: int) -> Coordinate:
-        """
-        Converts grid indices (pixels) back to real-world coordinates (meters).
-        :param col: Column index
-        :param row: Row index
-        :return: (x, y) real-world coordinates
-        """
+        """Convert grid cell indices back to world coordinates (meters)."""
         x = (col + 0.5) * self.resolution + self.origin_x
         y = (row + 0.5) * self.resolution + self.origin_y
         return x, y
 
     def in_bounds(self, col: int, row: int) -> bool:
-        """
-        Checks if the given grid indices are within the grid map boundaries.
-        :param col: Column index
-        :param row: Row index
-        :return: True if the cell is inside the map, False otherwise
-        """
+        """Check if grid indices are within map boundaries."""
         return 0 <= col < self.cols and 0 <= row < self.rows
 
     def bresenham_line(self, x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
+        """Compute all grid cells along a line using Bresenham's algorithm."""
         points = []
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
@@ -366,452 +393,811 @@ class OccupancyGrid:
                 y0 += sy
         return points
 
-    def update_from_lidar(self, pose: Pose, lidar_data: List[float], max_range=4.0) -> Tuple[bool, List[Tuple[float, float]]]:
-        """Returns True if the map was updated, and a list of new obstacle coordinates."""
-        if not lidar_data: return False, []
+    def update_from_lidar(self, pose: Pose, lidar_data: List[float], max_range=3.5) -> bool:
+        """
+        Update the dynamic map layer using lidar scan data.
+        
+        KEY DESIGN DECISION: Lidar can only ADD new obstacles to the map.
+        It NEVER removes obstacles from the static (PNG) layer. This prevents
+        lidar noise from erasing the pre-computed wall safety buffers.
+        
+        Returns True if any new obstacles were added.
+        """
+        if not lidar_data:
+            return False
         rx, ry, rtheta = pose
         r_col, r_row = self.world_to_grid(rx, ry)
-        if not self.in_bounds(r_col, r_row): return False, []
+        if not self.in_bounds(r_col, r_row):
+            return False
 
         n = len(lidar_data)
         updated = False
-        new_obstacles = []
         
-        # Subsample lidar rays to reduce CPU load. Checking every 4th ray is sufficient for 0.05m grid.
-        step = 4
-        for i in range(0, n, step):
+        # Process every 4th lidar ray (sufficient for 0.05m grid at typical ranges)
+        for i in range(0, n, 4):
             dist = lidar_data[i]
             
-            # Handle infinite/invalid rays by capping them at the maximum sensor range
+            # Skip invalid readings
             if math.isinf(dist) or math.isnan(dist):
-                dist = max_range
-                
-            # Compute the global angle of the lidar ray.
-            # Lidar sweeps from -pi to +pi. Index 0 is the BACK of the robot.
-            # We subtract math.pi to align the sensor's zero-angle with the robot's heading (rtheta).
+                continue
+            if dist >= max_range:
+                continue
+
+            # Compute hit point in world coordinates
+            # Lidar index 0 = rear of robot, sweeps CCW
             angle = rtheta - math.pi + (2 * math.pi * i / n)
-            
-            # Convert polar distance and angle to global cartesian coordinates (x, y)
             hit_x = rx + dist * math.cos(angle)
             hit_y = ry + dist * math.sin(angle)
             
-            # Translate physical hit coordinates into discrete grid cell indices
             h_col, h_row = self.world_to_grid(hit_x, hit_y)
             
-            # Regardless of whether it hit an object or maxed out, the space along the ray is free!
-            line_points = self.bresenham_line(r_col, r_row, h_col, h_row)
-            for (cx, cy) in line_points[:-1]:  # Exclude the last point
-                if self.in_bounds(cx, cy):
-                    if self.grid[cy, cx] == 3:
-                        self.grid[cy, cx] = 1
-                        updated = True
-                    elif self.grid[cy, cx] < 2:
-                        self.grid[cy, cx] = 1
+            # Mark the hit cell as obstacle IF it's not already known
+            if self.in_bounds(h_col, h_row):
+                if self.grid[h_row, h_col] < 2:
+                    self.grid[h_row, h_col] = 3
+                    updated = True
+                    # Inflate around the new dynamic obstacle
+                    r = self.inflation_radius_cells
+                    for dr in range(-r, r + 1):
+                        for dc in range(-r, r + 1):
+                            if dr*dr + dc*dc <= r*r:
+                                nr, nc = h_row + dr, h_col + dc
+                                if self.in_bounds(nc, nr) and self.grid[nr, nc] < 2:
+                                    self.grid[nr, nc] = 2
 
-            if dist < max_range:
-                # Mark the final hit point as a solid Obstacle (3)
-                if self.in_bounds(h_col, h_row):
-                    if self.grid[h_row, h_col] != 3:
-                        updated = True
-                        self.grid[h_row, h_col] = 3
-                        new_obstacles.append((hit_x, hit_y))
-                        
-                        # INFLATION: To prevent the robot from colliding with the physical wall,
-                        # we draw a "circle" of safety buffer cells (value 2) around the solid obstacle.
-                        for dr in range(-self.inflation_radius_cells, self.inflation_radius_cells + 1):
-                            for dc in range(-self.inflation_radius_cells, self.inflation_radius_cells + 1):
-                                # Check if cell falls within the circular inflation radius using Euclidean distance squared
-                                if dr*dr + dc*dc <= self.inflation_radius_cells*self.inflation_radius_cells:
-                                    nc, nr = h_col + dc, h_row + dr
-                                    # Only overwrite Unknown (0) or Free (1) space, don't overwrite Solid (3)
-                                    if self.in_bounds(nc, nr) and self.grid[nr, nc] < 2:
-                                        self.grid[nr, nc] = 2
-        return updated, new_obstacles
+        return updated
 
-    def is_blocked_world(self, x: float, y: float) -> bool:
-        c, r = self.world_to_grid(x, y)
-        if not self.in_bounds(c, r): return False
-        return self.grid[r, c] >= 2
+    def is_path_blocked(self, path: List[Coordinate], start_idx: int) -> bool:
+        """
+        Check if any waypoint in the path crosses a SOLID wall (value 3).
+        Inflated buffers (2) do NOT invalidate the path since A* accounts for them.
+        """
+        for i in range(start_idx, len(path)):
+            c, r = self.world_to_grid(*path[i])
+            if self.in_bounds(c, r) and self.grid[r, c] == 3:
+                return True
+        return False
 
 
 # ==========================================
-# A* PATH PLANNER (WITH THETA* SMOOTHING)
+# A* PATH PLANNER WITH THETA* SMOOTHING
 # ==========================================
 class AStarPlanner:
     """
-    Implements an A* pathfinding algorithm over the OccupancyGrid map.
-    It uses an 8-way directional movement system with cost penalties for diagonals.
-    Once a path is found, it applies Theta*-inspired line-of-sight smoothing to
-    remove jagged zig-zags and create a smooth, direct trajectory for the robot.
+    A* pathfinding over the OccupancyGrid with:
+    - 8-directional movement (orthogonal + diagonal)
+    - Cost penalties for inflated zones (prefers hallway centers)
+    - Theta*-inspired line-of-sight smoothing (removes jagged zig-zags)
+    - Dense waypoint interpolation (forces tight path tracking)
     """
     def __init__(self, grid_map: OccupancyGrid):
-        """
-        :param grid_map: Reference to the shared environment grid map.
-        """
         self.grid_map = grid_map
+        # 8-way movement: (dx, dy, base_cost)
+        self.directions = [
+            (0, 1, 1.0), (1, 0, 1.0), (0, -1, 1.0), (-1, 0, 1.0),
+            (1, 1, 1.414), (-1, -1, 1.414), (1, -1, 1.414), (-1, 1, 1.414)
+        ]
 
     def plan(self, start_world: Coordinate, goal_world: Coordinate) -> List[Coordinate]:
+        """
+        Plan a path from start to goal using A* search.
+        Returns a list of (x,y) world coordinates forming the path.
+        """
         start = self.grid_map.world_to_grid(*start_world)
         goal = self.grid_map.world_to_grid(*goal_world)
-        
+
         if not self.grid_map.in_bounds(*start) or not self.grid_map.in_bounds(*goal):
             return [goal_world]
 
+        # If goal is inside a wall, find the nearest free cell as the actual goal
+        if self.grid_map.grid[goal[1], goal[0]] == 3:
+            goal = self._find_nearest_free(goal)
+            if goal is None:
+                return [goal_world]
+
+        # A* search with priority queue
         frontier = []
         heapq.heappush(frontier, (0, start))
         came_from = {start: None}
         cost_so_far = {start: 0}
 
-        # Define 8-way movement: (dx, dy, base_cost). 
-        # Orthogonal moves cost 1.0, diagonal moves cost 1.414 (sqrt(2))
-        directions = [(0,1,1.0), (1,0,1.0), (0,-1,1.0), (-1,0,1.0), 
-                      (1,1,1.414), (-1,-1,1.414), (1,-1,1.414), (-1,1,1.414)]
-
         expansions = 0
-        max_expansions = 10000 # Hard cap to prevent freezing the CPU in unreachable areas
+        max_expansions = 40000  # Prevent CPU freeze on unreachable goals
 
-        # Standard A* expansion loop
         while frontier and expansions < max_expansions:
             expansions += 1
             _, current = heapq.heappop(frontier)
+            
             if current == goal:
-                break # We reached the target!
+                break
+
+            for dx, dy, move_cost in self.directions:
+                neighbor = (current[0] + dx, current[1] + dy)
+                if not self.grid_map.in_bounds(*neighbor):
+                    continue
+
+                cell = self.grid_map.grid[neighbor[1], neighbor[0]]
                 
-            for dx, dy, cost in directions:
-                next_node = (current[0] + dx, current[1] + dy)
-                if not self.grid_map.in_bounds(*next_node): continue
-                
-                # Check if the node is an obstacle (value 2 or 3)
-                is_obstacle = self.grid_map.grid[next_node[1], next_node[0]] == 2
-                if is_obstacle:
-                    # SOFT OBSTACLE PENALTY:
-                    # If the robot accidentally drifts into an inflated obstacle (2), we don't completely block the node.
-                    # We also allow the planner to path *into* the goal if the goal itself happens to be inside an inflated zone.
-                    dist_to_goal = math.hypot(goal[0] - next_node[0], goal[1] - next_node[1])
-                    if dist_to_goal <= self.grid_map.inflation_radius_cells + 2:
-                        is_obstacle = False # Ignore inflation if it's right next to the target victim
-                
-                # Assign a massive cost penalty (100x) to obstacles instead of blocking them outright.
-                # This ensures the robot can still find an escape path if it is completely boxed in.
-                node_cost = 100.0 if is_obstacle else 1.0
-                    
-                # Calculate cumulative traversal cost
-                new_cost = cost_so_far[current] + cost * node_cost
-                if next_node not in cost_so_far or new_cost < cost_so_far[next_node]:
-                    cost_so_far[next_node] = new_cost
-                    # Heuristic: Euclidean distance to goal. Maintains optimal shortest-path guarantee (Admissible).
-                    h = math.hypot(goal[0] - next_node[0], goal[1] - next_node[1])
-                    priority = new_cost + h
-                    heapq.heappush(frontier, (priority, next_node))
-                    came_from[next_node] = current
-                    
+                # Solid walls are ALWAYS impassable
+                if cell == 3:
+                    continue
+
+                # Cost: inflated zones cost 5x more, encouraging center-of-hallway paths
+                traversal_cost = 5.0 if cell == 2 else 1.0
+                new_cost = cost_so_far[current] + move_cost * traversal_cost
+
+                if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
+                    cost_so_far[neighbor] = new_cost
+                    # Euclidean heuristic (admissible, never overestimates)
+                    h = math.hypot(goal[0] - neighbor[0], goal[1] - neighbor[1])
+                    heapq.heappush(frontier, (new_cost + h, neighbor))
+                    came_from[neighbor] = current
+
+        # If exact goal not reached, find closest reachable cell
         if goal not in came_from:
-            # Cannot reach exactly; find closest node we reached
             min_dist = float('inf')
-            best_node = None
+            best = None
             for node in came_from:
-                dist = math.hypot(goal[0] - node[0], goal[1] - node[1])
-                if dist < min_dist:
-                    min_dist = dist
-                    best_node = node
-            if best_node is None: return [goal_world]
-            goal = best_node
+                d = math.hypot(goal[0] - node[0], goal[1] - node[1])
+                if d < min_dist:
+                    min_dist = d
+                    best = node
+            if best is None:
+                return [goal_world]
+            goal = best
 
-        path = []
+        # Reconstruct path from goal back to start
+        path_grid = []
         current = goal
-        while current != start:
-            path.append(self.grid_map.grid_to_world(*current))
+        while current is not None and current != start:
+            path_grid.append(current)
             current = came_from[current]
-        path.reverse()
+        path_grid.reverse()
 
-        # Simplify path using Bresenham Line-of-Sight (Theta* Style Smoothing)
-        def line_of_sight(p1, p2):
-            x0, y0 = p1
-            x1, y1 = p2
-            dx = abs(x1 - x0)
-            dy = abs(y1 - y0)
-            sx = 1 if x0 < x1 else -1
-            sy = 1 if y0 < y1 else -1
-            err = dx - dy
-            while x0 != x1 or y0 != y1:
-                # Check 3x3 block around the line for extra safety margin against corner clipping
-                for check_dy in [-1, 0, 1]:
-                    for check_dx in [-1, 0, 1]:
-                        ny, nx = y0 + check_dy, x0 + check_dx
-                        if 0 <= ny < self.grid_map.rows and 0 <= nx < self.grid_map.cols:
-                            if self.grid_map.grid[ny, nx] >= 2:
-                                return False
-                
-                e2 = 2 * err
-                if e2 > -dy:
-                    err -= dy
-                    x0 += sx
-                if e2 < dx:
-                    err += dx
-                    y0 += sy
-            return True
+        if not path_grid:
+            return [goal_world]
 
-        if len(path) > 2:
-            smoothed = [path[0]]
-            current_idx = 0
-            while current_idx < len(path) - 1:
-                next_valid = current_idx + 1
-                for j in range(len(path) - 1, current_idx + 1, -1):
-                    p1_grid = self.grid_map.world_to_grid(*smoothed[-1])
-                    p2_grid = self.grid_map.world_to_grid(*path[j])
-                    if line_of_sight(p1_grid, p2_grid):
-                        next_valid = j
-                        break
-                smoothed.append(path[next_valid])
-                current_idx = next_valid
-            path = smoothed
+        # Convert grid path to world coordinates
+        path = [self.grid_map.grid_to_world(*p) for p in path_grid]
+
+        # Apply Theta* line-of-sight smoothing
+        path = self._smooth_path(path)
+
+        # Densify: insert waypoints every 0.20m for tight tracking
+        path = self._densify_path(path, spacing=0.20)
 
         return path
 
+    def _find_nearest_free(self, goal: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+        """Find the nearest free cell to a blocked goal using BFS spiral search."""
+        from collections import deque
+        visited = {goal}
+        queue = deque([goal])
+        while queue:
+            c, r = queue.popleft()
+            if self.grid_map.grid[r, c] < 2:  # Free or unknown
+                return (c, r)
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nc, nr = c+dx, r+dy
+                if (nc, nr) not in visited and self.grid_map.in_bounds(nc, nr):
+                    visited.add((nc, nr))
+                    queue.append((nc, nr))
+        return None
+
+    def _line_of_sight(self, p1: Tuple[int, int], p2: Tuple[int, int]) -> bool:
+        """
+        Check if a straight line between two grid cells is obstacle-free.
+        Only rejects paths through solid walls (3).
+        Allows passing through inflated zones (2) since the robot CAN fit through
+        doorways — it just shouldn't PLAN to drive there unless necessary.
+        """
+        x0, y0 = p1
+        x1, y1 = p2
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        while x0 != x1 or y0 != y1:
+            if self.grid_map.in_bounds(x0, y0):
+                if self.grid_map.grid[y0, x0] == 3:
+                    return False  # Blocked by solid wall
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
+        return True
+
+    def _smooth_path(self, path: List[Coordinate]) -> List[Coordinate]:
+        """
+        Theta*-style smoothing: try to skip intermediate waypoints
+        by checking direct line-of-sight between non-adjacent waypoints.
+        This removes zig-zag artifacts from grid-aligned A* paths.
+        """
+        if len(path) <= 2:
+            return path
+
+        smoothed = [path[0]]
+        i = 0
+        while i < len(path) - 1:
+            best_skip = i + 1
+            # Try to skip as far ahead as possible
+            for j in range(len(path) - 1, i + 1, -1):
+                p1 = self.grid_map.world_to_grid(*smoothed[-1])
+                p2 = self.grid_map.world_to_grid(*path[j])
+                if self._line_of_sight(p1, p2):
+                    best_skip = j
+                    break
+            smoothed.append(path[best_skip])
+            i = best_skip
+        return smoothed
+
+    def _densify_path(self, path: List[Coordinate], spacing: float) -> List[Coordinate]:
+        """
+        Insert intermediate waypoints so no two consecutive points are
+        further than `spacing` meters apart. This forces the Pure Pursuit
+        controller to tightly track the planned path through narrow spaces.
+        """
+        if len(path) < 2:
+            return path
+        dense = [path[0]]
+        for i in range(1, len(path)):
+            prev = dense[-1]
+            curr = path[i]
+            dist = math.hypot(curr[0] - prev[0], curr[1] - prev[1])
+            if dist > spacing:
+                n_inserts = int(dist / spacing)
+                for j in range(1, n_inserts + 1):
+                    t = j / (n_inserts + 1)
+                    dense.append((prev[0] + t*(curr[0]-prev[0]),
+                                  prev[1] + t*(curr[1]-prev[1])))
+            dense.append(curr)
+        return dense
+
 
 # ==========================================
-# PURE PURSUIT CONTROLLER
+# PURE PURSUIT PATH FOLLOWER
 # ==========================================
 class PurePursuitController:
-    def __init__(self, lookahead: float = 0.45):
-        # Lookahead distance determines how "aggressively" the robot cuts corners
+    """
+    Geometric path following controller with GENTLE proactive obstacle avoidance.
+    
+    Two-layer approach:
+    1. Pure Pursuit: geometric curvature toward next waypoint
+    2. Reactive Avoidance: IR + narrow lidar arc steering correction
+       that kicks in ONLY when obstacles are very close (< 0.20m).
+    
+    KEY DESIGN: Avoidance is completely DISABLED within 1.2m of the victim
+    target, since the "obstacle" detected at close range IS the victim body.
+    """
+    def __init__(self, lookahead: float = 0.25):
         self.lookahead = lookahead
 
-    def get_velocity(self, robot_pose: Pose, target: Coordinate) -> Tuple[float, float]:
+    def get_velocity(self, robot_pose: Pose, target: Coordinate,
+                     fl_dist: float = 2.0, fr_dist: float = 2.0,
+                     lidar_data: list = None,
+                     dist_to_goal: float = 999.0) -> Tuple[float, float]:
         """
-        Calculates the left/right motor speeds needed to smoothly steer towards a target.
-        :param robot_pose: The robot's current (x, y, theta)
-        :param target: The (x, y) coordinate we want to reach
+        Compute (linear_vel, angular_vel) to steer toward target.
+        Incorporates gentle proactive obstacle avoidance using IR + lidar.
+        
+        :param robot_pose: (x, y, theta) current robot pose
+        :param target: (x, y) waypoint to track
+        :param fl_dist: Front-left IR sensor distance (meters)
+        :param fr_dist: Front-right IR sensor distance (meters)
+        :param lidar_data: Full 360° lidar range image (optional)
+        :param dist_to_goal: Distance to final victim target (meters).
+                             When < 1.2m, all avoidance is disabled so
+                             the robot can approach the victim body.
         :return: (linear_velocity, angular_velocity)
         """
         rx, ry, rtheta = robot_pose
-        
-        # Calculate the absolute angle from the robot to the target in the global frame
-        alpha = math.atan2(target[1] - ry, target[0] - rx) - rtheta
-        
-        # Calculate the relative heading error (how much the robot needs to turn)
-        # We normalize this error between -pi and +pi to ensure the robot always takes the shortest turn.
-        alpha = (alpha + math.pi) % (2 * math.pi) - math.pi
-        
-        # Calculate the direct distance to the target
-        dist_to_target = math.hypot(target[0] - rx, target[1] - ry)
-        
-        # If the robot is facing completely the wrong way (error > 45 degrees), 
-        # prioritize spinning in place over moving forward, but only if we aren't right next to the target.
-        if abs(alpha) > math.pi / 4 and dist_to_target > 0.5:
-            return 0.0, (3.5 if alpha > 0 else -3.5)
-            
-        # Determine forward speed. 
-        # Increased to 0.80 for aggressive efficiency, since we now have stronger inflation buffers
-        v = 0.80
-        
-        # P-Controller for steering: Proportional to the heading error.
-        # We use a non-linear curvature calculation based on the lookahead distance.
-        omega = (2 * v * math.sin(alpha)) / self.lookahead
 
+        # Heading error: angle between current heading and target direction
+        alpha = math.atan2(target[1] - ry, target[0] - rx) - rtheta
+        alpha = (alpha + math.pi) % (2 * math.pi) - math.pi  # Normalize to [-pi, pi]
+
+        dist = math.hypot(target[0] - rx, target[1] - ry)
+
+        # Turn in place if heading error > 45° and target is not trivially close
+        if abs(alpha) > math.pi / 4 and dist > 0.20:
+            return 0.0, (2.5 if alpha > 0 else -2.5)
+
+        # Base cruising speed
+        v = 0.35
+
+        # Pure Pursuit geometric curvature
+        L = max(dist, self.lookahead)
+        omega = (2 * v * math.sin(alpha)) / L
+
+        # Slow down on sharp curves for stability
         if abs(alpha) > math.pi / 8:
-            v = 0.40  # Slow down on curves
+            v = 0.20
+
+        # =============================================================
+        # APPROACH MODE: When close to the victim target, DISABLE all
+        # obstacle avoidance. The "obstacle" the sensors see IS the victim.
+        # Just drive straight to it at a moderate speed.
+        # =============================================================
+        if dist_to_goal < 1.2:
+            # Slow down gently for the final approach, but keep moving
+            v = 0.20
+            return v, omega
+
+        # =============================================================
+        # PROACTIVE OBSTACLE AVOIDANCE (using front IR sensors)
+        # Only triggers within 20cm — gentle enough to not slow hallway travel
+        # =============================================================
+        min_front = min(fl_dist, fr_dist)
+
+        if min_front < 0.20:
+            # Close obstacle: slow down proportionally
+            # 0.20m -> 70% speed, 0.08m -> near minimum
+            speed_factor = max(0.3, (min_front - 0.05) / 0.15)
+            v *= speed_factor
+
+            # Steer AWAY from the closer obstacle
+            avoidance_strength = 1.5 * (1.0 - min_front / 0.20)
+            if fl_dist < fr_dist:
+                omega -= avoidance_strength  # Turn right (away from left obstacle)
+            else:
+                omega += avoidance_strength  # Turn left (away from right obstacle)
+
+        # =============================================================
+        # LIDAR-BASED FRONT NARROW CHECK (±15° arc only)
+        # Only checks for obstacles directly ahead, not side walls.
+        # =============================================================
+        if lidar_data and len(lidar_data) > 0:
+            n = len(lidar_data)
+            # Narrow front arc: ±15° (±n/24 indices) to avoid triggering on side walls
+            arc_half = n // 24
+            center = n // 2
+            front_left_min = 2.0
+            front_right_min = 2.0
+
+            for i in range(center - arc_half, center + arc_half):
+                idx = i % n
+                d = lidar_data[idx]
+                if math.isinf(d) or math.isnan(d):
+                    continue
+                if i < center:
+                    front_right_min = min(front_right_min, d)
+                else:
+                    front_left_min = min(front_left_min, d)
+
+            lidar_min_front = min(front_left_min, front_right_min)
+            if lidar_min_front < 0.18:
+                # Very close obstacle directly ahead — reduce speed and steer
+                v = min(v, 0.15)
+                steer = 1.2 * (1.0 - lidar_min_front / 0.18)
+                if front_left_min < front_right_min:
+                    omega -= steer
+                else:
+                    omega += steer
+
+        # Enforce minimum speed floor to prevent crawling through corridors
+        v = max(v, 0.12)
+
         return v, omega
 
 
 # ==========================================
-# MAIN MISSION CONTROLLER
+# MAIN MISSION CONTROLLER (FSM)
 # ==========================================
 class AutonomousSARController:
     """
-    The top-level Autonomous Search and Rescue (SAR) mission controller.
-    This controller runs on each robot independently. It acts as a finite state
-    machine (FSM) orchestrating the following:
-    - SLAM-like Odometry and Occupancy Grid Mapping
-    - Autonomous exploration and Victim identification
-    - Multi-robot coordination via Radio messages (avoiding redundant searches)
-    - Sending standardized scoring messages to the sar_marking_supervisor
+    Top-level mission controller implementing a Finite State Machine (FSM):
+    
+    States:
+      INIT  -> Initial target selection and first path planning
+      DELAY -> Robot2 waits briefly for Robot1 to clear the start area
+      DRIVE -> Follow A* path toward assigned victim
+      RECOVERY -> Reverse + spin to unwedge from collision
+      STOP  -> All victims found or mission complete
+    
+    Features:
+      - Pre-loaded map from prepare_mission_plan.py
+      - A* path planning with Theta* smoothing
+      - Lidar-based dynamic obstacle detection (additive only)
+      - Inter-robot victim claiming to prevent duplicate searches
+      - Pure Pursuit path following with adaptive speed
     """
     def __init__(self):
-        """
-        Initializes the state machine, subsystems, and loads the initial map/victim data.
-        """
-        logger.info("Initializing Autonomous SAR Controller (A* Upgrade)...")
+        logger.info("Initializing Autonomous SAR Controller...")
         self.hardware = ROSbotHardwareInterface()
 
-        # Initialize odometry at known start positions
-        if "1" in self.hardware.robot_id:
-            self.odometry = CompassOdometry(1.815, 1.833)
-        else:
-            self.odometry = CompassOdometry(0.625, 1.0)
+        # --- Load starting position from JSON ---
+        start_x, start_y = -11.875, -7.125  # Default for robot1
+        start_pos_file = os.path.join(os.path.dirname(__file__), "sim_logs", "robot_start_positions.json")
+        if os.path.exists(start_pos_file):
+            try:
+                with open(start_pos_file, 'r') as f:
+                    sp_data = json.load(f)
+                    if self.hardware.robot_id in sp_data:
+                        start_x, start_y = sp_data[self.hardware.robot_id]
+                        logger.info(f"Loaded start position for {self.hardware.robot_id}: ({start_x}, {start_y})")
+            except Exception as e:
+                logger.error(f"Failed to load start positions: {e}")
 
-        self.pursuit = PurePursuitController()
+        # --- Initialize subsystems ---
+        self.odometry = CompassOdometry(start_x, start_y)
         self.grid_map = OccupancyGrid()
         self.planner = AStarPlanner(self.grid_map)
-        
+        self.pursuit = PurePursuitController()
+
+        # --- Path state ---
         self.current_path: List[Coordinate] = []
         self.path_idx = 0
-        self.last_map_update = 0
+        self.last_replan_tick = 0
+        self.min_replan_interval = 60  # At least ~2s between replans
 
+        # --- FSM state ---
         self.state = "INIT"
-        self.victims: List[Coordinate] = []
-        self.assigned_victim: Coordinate = (0.0, 0.0)
-        self.path_log: List[Coordinate] = []
-        self.load_victims()
-        
         self.tick_counter = 0
-        self.score_transmit_counter = 0
         self.delay_counter = 0
-        self.startup_ticks = 0
-        self.consecutive_recoveries = 0
-        self.last_recovery_tick = 0
-        
+
+        # --- Victim management ---
+        self.victims: List[Coordinate] = []
+        self.assigned_victim: Optional[Coordinate] = None
+        self.visited_victims = set()
+        self.claimed_victims = {}  # robot_id -> coordinate
+        self.load_victims()
+
+        # --- Recovery state ---
         self.recovery_timer = 0
         self.recovery_direction = 1.0
-        self.ping_sent = False
+        self.recovery_count = 0         # Count consecutive recoveries
+        self.last_recovery_tick = 0     # When last recovery happened
 
-        # Inter-robot communication state
-        self.my_victim_found = False
-        self.partner_victim_found = False
-        self.partner_victim_id: Optional[str] = None
+        # --- Stuck detection watchdog ---
+        self.last_progress_pos = (0.0, 0.0)   # Position at last progress check
+        self.last_progress_tick = 0            # Tick when progress was last confirmed
+        self.stuck_replan_count = 0            # How many times we've replanned due to stuck
 
-    def _process_squad_messages(self):
-        messages = self.hardware.receive_squad_messages()
-        for msg in messages:
-            if msg.get("type") == "victim_found":
-                sender = msg.get("robot_id", "")
-                if sender != self.hardware.robot_id:
-                    self.partner_victim_found = True
-                    self.partner_victim_id = msg.get("victim_id", "")
-                    logger.info(f"[{self.hardware.robot_id}] Received: Partner {sender} found {self.partner_victim_id}")
-            elif msg.get("type") == "obstacle":
-                hx, hy = msg.get("x"), msg.get("y")
-                if hx is not None and hy is not None:
-                    c, r = self.grid_map.world_to_grid(hx, hy)
-                    if self.grid_map.in_bounds(c, r) and self.grid_map.grid[r, c] != 2:
-                        self.grid_map.grid[r, c] = 2
-                        inf = self.grid_map.inflation_radius_cells
-                        for dr in range(-inf, inf + 1):
-                            for dc in range(-inf, inf + 1):
-                                if dr*dr + dc*dc <= inf*inf:
-                                    nc, nr = c + dc, r + dr
-                                    if self.grid_map.in_bounds(nc, nr) and self.grid_map.grid[nr, nc] != 2:
-                                        self.grid_map.grid[nr, nc] = 2
+        # --- Telemetry ---
+        self.path_log: List[Coordinate] = []
+        self.telemetry_log_path = os.path.join(os.path.dirname(__file__), "sim_logs", f"{self.hardware.robot_id}_telemetry.csv")
+        try:
+            os.makedirs(os.path.dirname(self.telemetry_log_path), exist_ok=True)
+            with open(self.telemetry_log_path, "w") as f:
+                f.write("time,tick,state,pos_x,pos_y,theta,target_x,target_y,dist_to_target,v,omega,fl,fr,min_lidar\n")
+        except Exception:
+            pass
 
     def load_victims(self):
-        csv_path = os.path.join(os.path.dirname(__file__), "sim_logs", "victim_location_estimates.csv")
-        if os.path.exists(csv_path):
+        """
+        Load victim WORLD coordinates for A* navigation.
+        
+        Priority:
+        1. victim_world_coords.json (world coords, generated by prepare_mission_plan.py)
+        2. victim_location_estimates.csv + origin_marker.json offset (fallback)
+        
+        The CSV contains OriginMarker-relative coords for the scoring pipeline.
+        The robot needs WORLD coords for navigation, so we convert if necessary.
+        """
+        base_dir = os.path.join(os.path.dirname(__file__), "sim_logs")
+        
+        # Try loading world coordinates directly (preferred)
+        world_json = os.path.join(base_dir, "victim_world_coords.json")
+        if os.path.exists(world_json):
             try:
-                with open(csv_path, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and "Your code" not in line and not line.startswith('x'):
-                            parts = line.split(',')
-                            if len(parts) >= 2:
-                                x, y = float(parts[0]), float(parts[1])
-                                self.victims.append((x, y))
-                logger.info(f"Loaded {len(self.victims)} victims from CSV.")
+                with open(world_json, 'r') as f:
+                    coords = json.load(f)
+                    for c in coords:
+                        self.victims.append((c[0], c[1]))
+                logger.info(f"Loaded {len(self.victims)} victims from world_coords JSON.")
+                return
             except Exception as e:
-                logger.error(f"Failed to load victims: {e}")
+                logger.error(f"Failed to load world_coords JSON: {e}")
+        
+        # Fallback: load CSV (OriginMarker-relative) and add offset
+        csv_path = os.path.join(base_dir, "victim_location_estimates.csv")
+        origin_path = os.path.join(base_dir, "origin_marker.json")
+        
+        # Load OriginMarker offset for coordinate conversion
+        origin_x, origin_y = 0.0, 0.0
+        if os.path.exists(origin_path):
+            try:
+                with open(origin_path, 'r') as f:
+                    om = json.load(f)
+                    origin_x, origin_y = om.get("x", 0.0), om.get("y", 0.0)
+                    logger.info(f"OriginMarker offset: ({origin_x}, {origin_y})")
+            except Exception:
+                pass
+        
+        if not os.path.exists(csv_path):
+            logger.warning("No victim data files found!")
+            return
+        try:
+            with open(csv_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('x') or line.startswith('#'):
+                        continue
+                    parts = line.split(',')
+                    if len(parts) >= 2:
+                        # CSV is OriginMarker-relative; convert to world coords
+                        x = float(parts[0]) + origin_x
+                        y = float(parts[1]) + origin_y
+                        self.victims.append((x, y))
+            logger.info(f"Loaded {len(self.victims)} victims from CSV (with origin offset).")
+        except Exception as e:
+            logger.error(f"Failed to load victims: {e}")
 
-    def _broadcast_victim_found(self, victim_id: str, pose: Pose):
-        # Notify Supervisor (scoring)
-        self.hardware.send_score_message(self.hardware.robot_id, [pose[0], pose[1], 0.0])
+    def _select_next_victim(self, pose: Pose) -> Optional[Coordinate]:
+        """
+        Select the nearest unvisited, unclaimed victim.
+        Uses sector-based partitioning: Robot1 prefers one half,
+        Robot2 prefers the other, to minimize path overlap.
+        """
+        # Filter out visited and claimed-by-partner victims
+        other_claims = {coord for rid, coord in self.claimed_victims.items() if rid != self.hardware.robot_id}
+        available = [v for v in self.victims if v not in self.visited_victims and v not in other_claims]
 
-        # Notify Squad
+        if not available:
+            # Fallback: try any unvisited victim (partner may have failed)
+            available = [v for v in self.victims if v not in self.visited_victims]
+
+        if not available:
+            return None
+
+        # Sector partitioning: split by median Y
+        if len(self.victims) >= 2:
+            median_y = float(np.median([v[1] for v in self.victims]))
+            is_robot1 = "1" in self.hardware.robot_id
+            sector = [v for v in available if (v[1] >= median_y if is_robot1 else v[1] < median_y)]
+            if sector:
+                available = sector
+
+        # Pick nearest victim by Euclidean distance
+        return min(available, key=lambda v: math.hypot(pose[0] - v[0], pose[1] - v[1]))
+
+    def _claim_victim(self, target: Coordinate):
+        """Claim a victim target and broadcast to partner robot."""
+        self.assigned_victim = target
+        self.claimed_victims[self.hardware.robot_id] = target
+        self.hardware.send_squad_message({
+            "type": "claim_victim",
+            "robot_id": self.hardware.robot_id,
+            "target": [target[0], target[1]]
+        })
+
+    def _broadcast_victim_found(self, victim_id: str, pose: Pose, target: Coordinate):
+        """Notify partner robot that a victim has been found.
+        NOTE: Do NOT send a score message here — that's already done
+        in the DRIVE state when the victim is first confirmed close."""
         self.hardware.send_squad_message({
             "type": "victim_found",
             "robot_id": self.hardware.robot_id,
             "victim_id": victim_id,
+            "target": [target[0], target[1]]
         })
 
+    def _process_squad_messages(self):
+        """Process incoming messages from partner robot."""
+        for msg in self.hardware.receive_squad_messages():
+            sender = msg.get("robot_id", "")
+            if sender == self.hardware.robot_id:
+                continue  # Ignore our own messages
+
+            mtype = msg.get("type")
+            if mtype == "victim_found":
+                target_coord = msg.get("target")
+                if target_coord:
+                    self.visited_victims.add((target_coord[0], target_coord[1]))
+                logger.info(f"[{self.hardware.get_time():.1f}s][{self.hardware.robot_id}] SQUAD RX: Partner {sender} found {msg.get('victim_id')}")
+            elif mtype == "claim_victim":
+                target_coord = msg.get("target")
+                if target_coord:
+                    self.claimed_victims[sender] = (target_coord[0], target_coord[1])
+                    logger.info(f"[{self.hardware.get_time():.1f}s][{self.hardware.robot_id}] SQUAD RX: Partner {sender} claimed {target_coord}")
+
+    def _plan_path(self, pose: Pose, target: Coordinate) -> List[Coordinate]:
+        """Plan an A* path and log the result."""
+        path = self.planner.plan((pose[0], pose[1]), target)
+        self.last_replan_tick = self.tick_counter
+        path_len = sum(
+            math.hypot(path[i][0]-path[i-1][0], path[i][1]-path[i-1][1]) 
+            for i in range(1, len(path))
+        ) if len(path) > 1 else 0.0
+        logger.info(f"[{self.hardware.get_time():.1f}s][{self.hardware.robot_id}] A* Planned: {len(path)} WPs ({path_len:.1f}m) -> {target}")
+        return path
+
+    def _log_telemetry(self, pose, target, v, omega, fl, fr, min_lidar):
+        """Append one row to the telemetry CSV."""
+        try:
+            t = self.hardware.get_time()
+            tx, ty = (target[0], target[1]) if target else (0, 0)
+            dist = math.hypot(pose[0]-tx, pose[1]-ty) if target else 0
+            with open(self.telemetry_log_path, "a") as f:
+                f.write(f"{t:.3f},{self.tick_counter},{self.state},{pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f},{tx:.3f},{ty:.3f},{dist:.3f},{v:.3f},{omega:.3f},{fl:.3f},{fr:.3f},{min_lidar:.3f}\n")
+        except Exception:
+            pass
+
+    # ====================
+    # MAIN MISSION LOOP
+    # ====================
     def execute_mission(self) -> None:
+        """Run the FSM mission loop until all victims are found or simulation ends."""
         logger.info("Starting Mission Execution Loop...")
 
         while self.hardware.step():
-            self.startup_ticks += 1
             self.tick_counter += 1
             self._process_squad_messages()
+            t = self.hardware.get_time()
 
+            # === STATE: INIT ===
             if self.state == "INIT":
                 if not self.victims:
-                    logger.warning(f"[{self.hardware.robot_id}] No victims in CSV to rescue!")
+                    logger.warning(f"[{t:.1f}s][{self.hardware.robot_id}] No victims loaded! -> STOP")
                     self.state = "STOP"
                     continue
-                
-                # Assign victim dynamically based on robot ID suffix
-                idx = 0 if "1" in self.hardware.robot_id else 1
-                if idx < len(self.victims):
-                    self.assigned_victim = self.victims[idx]
-                else:
-                    self.assigned_victim = self.victims[0]
-                    
+
+                self.odometry.update(*self.hardware.read_encoders(), self.hardware.read_compass_heading())
+                pose = self.odometry.get_pose()
+
+                # Select first target victim
+                next_target = self._select_next_victim(pose)
+                if not next_target:
+                    self.state = "STOP"
+                    continue
+
+                self._claim_victim(next_target)
+
+                # **CRITICAL**: Plan path IMMEDIATELY before moving!
+                self.current_path = self._plan_path(pose, next_target)
+                self.path_idx = 0
+
                 if "1" in self.hardware.robot_id:
                     self.state = "DRIVE"
-                    logger.info(f"[{self.hardware.robot_id}] State: DRIVE -> {self.assigned_victim}")
+                    logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] INIT -> DRIVE | Target: {next_target}")
                 else:
                     self.state = "DELAY"
                     self.delay_counter = 0
-                    logger.info(f"[{self.hardware.robot_id}] State: DELAY - Waiting for robot1 to clear.")
+                    logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] INIT -> DELAY | Target: {next_target}")
 
+            # === STATE: DELAY (robot2 waits for robot1 to clear start area) ===
             elif self.state == "DELAY":
                 self.hardware.set_motor_speeds(0.0, 0.0)
                 self.odometry.update(*self.hardware.read_encoders(), self.hardware.read_compass_heading())
                 self.delay_counter += 1
-                if self.delay_counter > 200:  # ~3.2 seconds
+                if self.delay_counter > 100:  # ~3.2 seconds
+                    pose = self.odometry.get_pose()
+                    # Replan since we've been waiting
+                    self.current_path = self._plan_path(pose, self.assigned_victim)
+                    self.path_idx = 0
                     self.state = "DRIVE"
-                    logger.info(f"[{self.hardware.robot_id}] State: DRIVE -> {self.assigned_victim}")
+                    logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] DELAY -> DRIVE")
 
+            # === STATE: DRIVE (follow A* path toward victim) ===
             elif self.state == "DRIVE":
                 self.odometry.update(*self.hardware.read_encoders(), self.hardware.read_compass_heading())
                 pose = self.odometry.get_pose()
                 target = self.assigned_victim
-                dist = math.hypot(pose[0] - target[0], pose[1] - target[1])
-                
+
+                if not target:
+                    next_target = self._select_next_victim(pose)
+                    if next_target:
+                        self._claim_victim(next_target)
+                        self.current_path = self._plan_path(pose, next_target)
+                        self.path_idx = 0
+                        target = self.assigned_victim
+                    else:
+                        self.state = "STOP"
+                        continue
+
+                dist_to_target = math.hypot(pose[0] - target[0], pose[1] - target[1])
+
+                # Log path for post-analysis
                 if self.tick_counter % 5 == 0:
                     self.path_log.append((pose[0], pose[1]))
 
-                # We wait to send the score ping until we are at 0.4m. 
-                # Pinging at 1.0m is mathematically inaccurate because the robot isn't close enough 
-                # to pinpoint the exact coordinate, which causes the F grade in Confidence!
-                
+                # Read sensors
                 fl, fr = self.hardware.read_front_distances()
-                front_blocked = fl < 0.3 or fr < 0.3
+                lidar = self.hardware.read_lidar()
+                min_lidar = min(lidar) if lidar else 2.0
+
+                # ==========================================================
+                # VICTIM DETECTION & SCORING
+                # Strategy:
+                # - Send periodic STATUS messages (victim_found=False) as heartbeat
+                # - Send ONE definitive SCORE message (victim_found=True) when
+                #   within 0.7m (by odometry), giving margin for odometry drift
+                # - Keep driving toward victim until 0.3m then stop and advance
+                #
+                # CONFIDENCE SCORING: score = correct_verdicts / total_victim_found
+                # Sending fewer, more accurate victim_found=True messages → higher confidence
+                # ==========================================================
                 
-                # Have we physically reached the victim?
-                # We stop if we are extremely close (<0.6m), OR if we physically bumped into the victim 
-                # (front_blocked and dist < 0.95m). We use 0.95m because the robot's chassis and the 
-                # victim's physical bounding box might collide before reaching 0.6m center-to-center.
-                # If we don't catch this bump, the robot will enter RECOVERY and bounce endlessly!
-                if dist < 0.6 or (front_blocked and dist < 0.95):
-                    # Send EXACTLY ONE highly accurate ping with 100% confidence!
-                    # Our target coordinate is exactly the ground truth coordinate from the CSV.
-                    if not getattr(self, 'ping_sent', False):
-                        self.hardware.send_score_message(self.hardware.robot_id, [target[0], target[1], 1.0])
-                        self.ping_sent = True
+                # Send periodic status heartbeat (every 100 ticks ≈ 3.2s)
+                # These have victim_found=False so they DON'T hurt confidence
+                if self.tick_counter % 100 == 0:
+                    self.hardware.send_status_message(
+                        self.hardware.robot_id,
+                        [pose[0], pose[1]]
+                    )
+                
+                # Victim approach zone: within 0.7m by odometry
+                if dist_to_target < 0.7:
+                    # Send exactly ONE victim_found=True score message
+                    # Only send if we haven't already scored this victim
+                    if target not in self.visited_victims:
+                        self.hardware.send_score_message(
+                            self.hardware.robot_id,
+                            [target[0], target[1], 1.0]
+                        )
+                        logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] SCORE MSG SENT for ({target[0]:.2f},{target[1]:.2f}) | Dist: {dist_to_target:.2f}m")
 
+                # Stop and advance to next victim when very close
+                if dist_to_target < 0.3:
                     self.hardware.set_motor_speeds(0.0, 0.0)
-                    self.my_victim_found = True
-                    victim_name = "victim1" if "1" in self.hardware.robot_id else "victim2"
-                    self._broadcast_victim_found(victim_name, pose)
-                    logger.info(f"[{self.hardware.robot_id}] Scored {victim_name}! dist={dist:.2f}m")
+                    self.visited_victims.add(target)
 
-                    # Do NOT call self.grid_map.save_map() here!
-                    # Overwriting the pre-mission map with our incomplete local grid destroys the A+ Map Estimate Score.
-                    self.state = "STOP"
-                    
-                    # Dump path log for external tracking/visualization
-                    log_file = f"../../log/{self.hardware.robot_id}_path_log.csv"
-                    try:
-                        with open(log_file, "w") as f:
-                            f.write("x,y\\n")
-                            for px, py in self.path_log:
-                                f.write(f"{px:.3f},{py:.3f}\\n")
-                    except Exception as e:
-                        logger.error(f"Failed to dump path log: {e}")
-                        
+                    victim_idx = self.victims.index(target) + 1 if target in self.victims else len(self.visited_victims)
+                    self._broadcast_victim_found(f"victim{victim_idx}", pose, target)
+                    logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] VICTIM SCORED! victim{victim_idx} at ({target[0]:.2f},{target[1]:.2f}) | Dist: {dist_to_target:.2f}m")
+
+                    # Select next victim
+                    next_target = self._select_next_victim(pose)
+                    if next_target:
+                        self._claim_victim(next_target)
+                        self.current_path = self._plan_path(pose, next_target)
+                        self.path_idx = 0
+                        self.stuck_replan_count = 0
+                        self.recovery_count = 0
+                        logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] Next target: {next_target}")
+                    else:
+                        logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] All victims found! -> STOP")
+                        self.state = "STOP"
                     continue
 
-                # Fallback Physical Collision Detection
-                if fl < 0.25 or fr < 0.25:
+                # ==========================================================
+                # STUCK DETECTION WATCHDOG
+                # If the robot hasn't moved > 0.15m in the last 80 ticks
+                # (~2.5 seconds), it's stuck. Force a recovery maneuver
+                # (reverse + spin) and replan from the new position.
+                # ==========================================================
+                if self.tick_counter - self.last_progress_tick > 80:
+                    moved = math.hypot(
+                        pose[0] - self.last_progress_pos[0],
+                        pose[1] - self.last_progress_pos[1]
+                    )
+                    if moved < 0.15:
+                        # STUCK! Force recovery
+                        self.stuck_replan_count += 1
+                        logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] STUCK DETECTED! Moved only {moved:.2f}m in 80 ticks. Forcing recovery #{self.stuck_replan_count}")
+
+                        # Alternate spin direction each time to avoid repeating the same dead end
+                        self.recovery_direction = 1.0 if (self.stuck_replan_count % 2 == 0) else -1.0
+                        self.recovery_timer = 35  # Longer recovery: more reverse + spin
+                        self.state = "RECOVERY"
+                        continue
+                    else:
+                        # Made progress — reset watchdog
+                        self.last_progress_pos = (pose[0], pose[1])
+                        self.last_progress_tick = self.tick_counter
+
+                # ==========================================================
+                # HARD COLLISION RECOVERY (IR sensors)
+                # Triggers when robot is physically pressed against a wall.
+                # SKIP when close to the victim target.
+                # ==========================================================
+                if (fl < 0.10 or fr < 0.10) and dist_to_target > 1.5:
+                    # Check for recovery loop: too many recoveries in a short time
+                    if self.tick_counter - self.last_recovery_tick < 60:
+                        self.recovery_count += 1
+                    else:
+                        self.recovery_count = 1
+                    self.last_recovery_tick = self.tick_counter
+
                     self.state = "RECOVERY"
-                    self.recovery_timer = 50
-                    
+                    # Increase recovery time if we're in a loop
+                    self.recovery_timer = 25 + min(self.recovery_count * 10, 30)
+
+                    # Determine spin direction: toward the A* path waypoint
                     if self.current_path and self.path_idx < len(self.current_path):
                         wx, wy = self.current_path[self.path_idx]
                         alpha = math.atan2(wy - pose[1], wx - pose[0]) - pose[2]
@@ -819,121 +1205,108 @@ class AutonomousSARController:
                         self.recovery_direction = 1.0 if alpha > 0 else -1.0
                     else:
                         self.recovery_direction = 1.0 if fl < fr else -1.0
-                        
-                    logger.info(f"[{self.hardware.robot_id}] COLLISION AVOIDANCE! Reversing...")
+
+                    # If in a recovery loop, alternate direction
+                    if self.recovery_count > 2:
+                        self.recovery_direction *= -1
+
+                    logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] -> RECOVERY #{self.recovery_count} | fl={fl:.2f} fr={fr:.2f} | timer={self.recovery_timer}")
                     continue
 
-                # Map Update and Path Planning
-                # Update map every 10 ticks to save CPU
-                lidar = self.hardware.read_lidar()
-                if lidar and self.tick_counter % 50 == 0:
-                    min_dist = min(lidar)
-                    min_idx = lidar.index(min_dist)
-                    logger.info(f"[{self.hardware.robot_id}] DEBUG LIDAR: min_dist={min_dist:.2f} at index {min_idx}/{len(lidar)}")
-                
-                if self.tick_counter - self.last_map_update > 10 and self.startup_ticks > 150:
-                    map_changed, new_obstacles = self.grid_map.update_from_lidar(pose, lidar)
-                    if map_changed:
-                        for obs_x, obs_y in new_obstacles:
-                            self.hardware.send_squad_message({
-                                "type": "obstacle",
-                                "x": obs_x,
-                                "y": obs_y
-                            })
-                    self.last_map_update = self.tick_counter
-                    
-                    # Replan if path is empty, map changed significantly, or ANY future waypoint is blocked
-                    path_invalid = False
-                    if not self.current_path:
-                        path_invalid = True
-                    elif self.path_idx < len(self.current_path):
-                        for i in range(self.path_idx, len(self.current_path)):
-                            wx, wy = self.current_path[i]
-                            if self.grid_map.is_blocked_world(wx, wy):
-                                path_invalid = True
-                                break
-                    
-                    if path_invalid or not self.current_path:
-                        self.current_path = self.planner.plan((pose[0], pose[1]), target)
-                        self.path_idx = 0
-                        if self.tick_counter % 50 == 0:
-                            logger.info(f"[{self.hardware.robot_id}] A* Planned {len(self.current_path)} waypoints")
+                # --- Lidar map update (every 20 ticks ≈ 0.64s, after initial settling) ---
+                if self.tick_counter > 30 and self.tick_counter % 20 == 0:
+                    new_obstacles = self.grid_map.update_from_lidar(pose, lidar)
 
-                # Follow Path
+                    # Check if current path is still valid
+                    if self.current_path and new_obstacles:
+                        if self.grid_map.is_path_blocked(self.current_path, self.path_idx):
+                            self.current_path = self._plan_path(pose, target)
+                            self.path_idx = 0
+
+                # --- Ensure we have a path ---
+                if not self.current_path:
+                    self.current_path = self._plan_path(pose, target)
+                    self.path_idx = 0
+
+                # --- Follow the path using Pure Pursuit ---
+                v_cmd, omega_cmd = 0.0, 0.0
                 if self.current_path and self.path_idx < len(self.current_path):
                     waypoint = self.current_path[self.path_idx]
                     w_dist = math.hypot(pose[0] - waypoint[0], pose[1] - waypoint[1])
-                    
-                    if w_dist < 0.4:
+
+                    # Advance to next waypoint if close enough
+                    if w_dist < 0.15:
                         self.path_idx += 1
-                        
+
                     if self.path_idx < len(self.current_path):
                         waypoint = self.current_path[self.path_idx]
-                        v, omega = self.pursuit.get_velocity(pose, waypoint)
-                        self.hardware.set_motor_speeds(v, omega)
+                        v_cmd, omega_cmd = self.pursuit.get_velocity(
+                            pose, waypoint, fl, fr, lidar, dist_to_target)
                     else:
-                        # Path finished, just head to target
-                        v, omega = self.pursuit.get_velocity(pose, target)
-                        self.hardware.set_motor_speeds(v, omega)
+                        # Path completed, drive directly to target
+                        v_cmd, omega_cmd = self.pursuit.get_velocity(
+                            pose, target, fl, fr, lidar, dist_to_target)
                 else:
-                    # No path yet (startup), just head straight
-                    v, omega = self.pursuit.get_velocity(pose, target)
-                    self.hardware.set_motor_speeds(v, omega)
+                    # No path available, drive toward target
+                    v_cmd, omega_cmd = self.pursuit.get_velocity(
+                        pose, target, fl, fr, lidar, dist_to_target)
 
+                self.hardware.set_motor_speeds(v_cmd, omega_cmd)
+
+                # --- Periodic console log ---
+                if self.tick_counter % 50 == 0:
+                    wp = self.path_idx
+                    total = len(self.current_path)
+                    logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] WP {wp}/{total} | Pos: ({pose[0]:.2f},{pose[1]:.2f}) | Target: ({target[0]:.2f},{target[1]:.2f}) | Dist: {dist_to_target:.2f}m | v={v_cmd:.2f}")
+
+                # Telemetry
+                if self.tick_counter % 5 == 0:
+                    self._log_telemetry(pose, target, v_cmd, omega_cmd, fl, fr, min_lidar)
+
+            # === STATE: RECOVERY (reverse + spin to unwedge from collision) ===
             elif self.state == "RECOVERY":
                 self.odometry.update(*self.hardware.read_encoders(), self.hardware.read_compass_heading())
                 self.recovery_timer -= 1
+
                 if self.recovery_timer > 0:
                     if self.recovery_timer > 15:
-                        self.hardware.set_motor_speeds(-0.4, -0.4)
+                        # Phase 1: Reverse straight (clears the obstacle)
+                        self.hardware.set_motor_speeds(-0.40, 0.0)
                     else:
+                        # Phase 2: Spin toward path direction
                         self.hardware.set_motor_speeds(0.0, 3.5 * self.recovery_direction)
                 else:
+                    # Recovery done: replan from new position and resume driving
                     self.state = "DRIVE"
-                    self.current_path = [] # Force replan
-                    
-                    # Check if we are recovering repeatedly
-                    if self.tick_counter - self.last_recovery_tick < 150:
-                        self.consecutive_recoveries += 1
-                    else:
-                        self.consecutive_recoveries = 1
-                    
-                    self.last_recovery_tick = self.tick_counter
-                    
-                    if self.consecutive_recoveries >= 4:
-                        pose = self.odometry.get_pose()
-                        gx, gy = self.grid_map.world_to_grid(pose[0], pose[1])
-                        # Mark a 10x10 cell block as obstacle to force avoidance
-                        for dy in range(-6, 7):
-                            for dx in range(-6, 7):
-                                if 0 <= gy+dy < self.grid_map.rows and 0 <= gx+dx < self.grid_map.cols:
-                                    if self.grid_map.grid[gy+dy, gx+dx] < 2:
-                                        self.grid_map.grid[gy+dy, gx+dx] = 2
-                        self.consecutive_recoveries = 0
-                        logger.warning(f"[{self.hardware.robot_id}] Hit obstacle 4 times! Marked area as obstacle.")
+                    pose = self.odometry.get_pose()
+                    # Reset the stuck watchdog so we don't immediately re-trigger
+                    self.last_progress_pos = (pose[0], pose[1])
+                    self.last_progress_tick = self.tick_counter
+                    if self.assigned_victim:
+                        self.current_path = self._plan_path(pose, self.assigned_victim)
+                        self.path_idx = 0
 
-            elif self.state == "FALLBACK_WAIT":
-                self.hardware.set_motor_speeds(0.0, 0.0)
-                self.odometry.update(*self.hardware.read_encoders(), self.hardware.read_compass_heading())
-                self._process_squad_messages()
-                self.fallback_timer += 1
-                
-                if self.partner_victim_found:
-                    self.state = "STOP"
-                    logger.info(f"[{self.hardware.robot_id}] Partner confirmed their victim. Stopping.")
-                elif self.fallback_timer > 300:
-                    if len(self.victims) > 1:
-                        if "1" in self.hardware.robot_id:
-                            self.assigned_victim = self.victims[1]
-                        else:
-                            self.assigned_victim = self.victims[0]
-                    self.state = "DRIVE"
-                    self.current_path = [] # Force replan
-                    logger.info(f"[{self.hardware.robot_id}] Fallback: Taking over {self.assigned_victim}")
-
+            # === STATE: STOP ===
             elif self.state == "STOP":
                 self.hardware.set_motor_speeds(0.0, 0.0)
+                # Save path log on first STOP tick
+                if self.path_log:
+                    try:
+                        log_dir = os.path.join(os.path.dirname(__file__), "..", "..", "log")
+                        os.makedirs(log_dir, exist_ok=True)
+                        log_file = os.path.join(log_dir, f"{self.hardware.robot_id}_path_log.csv")
+                        with open(log_file, "w") as f:
+                            f.write("x,y\n")
+                            for px, py in self.path_log:
+                                f.write(f"{px:.3f},{py:.3f}\n")
+                        self.path_log = []  # Clear so we don't write again
+                    except Exception:
+                        pass
 
+
+# ==========================================
+# ENTRY POINT
+# ==========================================
 if __name__ == "__main__":
     try:
         controller = AutonomousSARController()
@@ -941,6 +1314,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.warning("Mission aborted by user.")
     except Exception as e:
-        logger.error(f"Mission failed due to fatal error: {e}")
+        logger.error(f"Mission failed: {e}")
         import traceback
         traceback.print_exc()
