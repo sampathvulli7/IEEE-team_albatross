@@ -852,6 +852,7 @@ class AutonomousSARController:
         self.scoring_victim: Optional[Coordinate] = None
         self.scoring_pulse_timer = 0    # Ticks left to keep sending score pulses
         self.scoring_pulse_count = 0    # How many pulses sent
+        self.post_score_cooldown = 0    # Ticks of immunity from hard-collision check after scoring
 
         # --- Stuck detection watchdog ---
         self.last_progress_pos = (0.0, 0.0)   # Position at last progress check
@@ -1093,6 +1094,10 @@ class AutonomousSARController:
             elif self.state == "DRIVE":
                 self.odometry.update(*self.hardware.read_encoders(), self.hardware.read_compass_heading())
                 pose = self.odometry.get_pose()
+                # Count down post-scoring IR cooldown (suppresses hard-collision check
+                # while the robot drives away from the victim body area after scoring)
+                if self.post_score_cooldown > 0:
+                    self.post_score_cooldown -= 1
                 target = self.assigned_victim
 
                 if not target:
@@ -1203,6 +1208,10 @@ class AutonomousSARController:
                             self.scoring_pulse_timer = 0
                             self.scoring_pulse_count = 0
                             self.scoring_victim = None
+                            # Suppress hard-collision IR check for 80 ticks (~2.5s)
+                            # so the robot can drive away from the victim area without
+                            # the rear-wall IR reading (after reverse) looping it back into RECOVERY.
+                            self.post_score_cooldown = 80
                             next_target = self._select_next_victim(pose)
                             if next_target:
                                 self._claim_victim(next_target)
@@ -1217,10 +1226,14 @@ class AutonomousSARController:
                         continue
 
                     # ---- APPROACH: drive directly toward victim ----
-                    # Stop when IR sensor < 0.20m (physically touching victim body)
-                    # or when odometry says <= 0.20m (tight failsafe — avoids false-positive
-                    # score messages from odometry drift, keeping confidence score near 1.0)
-                    at_victim = (fl < 0.20 or fr < 0.20 or dist_to_target <= 0.20)
+                    # Two-condition approach to avoid false triggers on walls/furniture:
+                    #   IR contact (fl or fr < 0.15m) is only valid when odometry also
+                    #   confirms we are within 1.0m of the victim — this prevents hitting
+                    #   a bed frame 1.5m from victim1 and falsely scoring it.
+                    #   The pure odometry fallback (<=0.20m) handles flat/non-solid victims
+                    #   like victim3 where IR doesn't detect the body at all.
+                    ir_contact = (fl < 0.15 or fr < 0.15)
+                    at_victim = (ir_contact and dist_to_target < 1.0) or dist_to_target <= 0.20
 
                     if at_victim:
                         self.hardware.set_motor_speeds(0.0, 0.0)
@@ -1306,7 +1319,7 @@ class AutonomousSARController:
                 # Triggers when robot is physically pressed against a wall.
                 # SKIP when close to the victim target.
                 # ==========================================================
-                if (fl < 0.10 or fr < 0.10) and dist_to_target > 1.5:
+                if (fl < 0.10 or fr < 0.10) and dist_to_target > 1.5 and self.post_score_cooldown <= 0:
                     # Check for recovery loop: too many recoveries in a short time
                     if self.tick_counter - self.last_recovery_tick < 60:
                         self.recovery_count += 1
