@@ -294,8 +294,9 @@ class OccupancyGrid:
     Cell values:
       0 = Unknown/unexplored
       1 = Free space (confirmed by map or lidar)
-      2 = Inflated safety buffer (around obstacles)
+      2 = Hard inflated safety buffer (around obstacles)
       3 = Solid obstacle (wall/object)
+      4 = Soft inflated safety buffer (promotes corridor centering)
     
     COORDINATE SYSTEM:
       The map uses the supervisor's Y-flipped coordinate mapping:
@@ -310,8 +311,9 @@ class OccupancyGrid:
         self.world_max_y = 25.0
         self.cols = cols
         self.rows = rows
-        # Inflation radius in grid cells (3 cells * 0.05m = 0.15m clearance)
-        self.inflation_radius_cells = 3
+        # Inflation radius in grid cells (5 cells * 0.05m = 0.25m clearance)
+        # Increased to 5 to ensure safe cornering around dynamic obstacles
+        self.inflation_radius_cells = 5
         
         # Load map metadata first to get correct coordinate system
         self._load_map_metadata()
@@ -366,17 +368,23 @@ class OccupancyGrid:
 
             # Inflate walls: add safety buffer cells around every wall cell
             wall_mask = (self.grid == 3)
-            r = self.inflation_radius_cells
+            r_solid = self.inflation_radius_cells  # 5
+            r_soft = 7                             # Extends to 0.35m for centering
             for row in range(self.rows):
                 for col in range(self.cols):
                     if wall_mask[row, col]:
-                        for dr in range(-r, r + 1):
-                            for dc in range(-r, r + 1):
-                                if dr*dr + dc*dc <= r*r:
+                        for dr in range(-r_soft, r_soft + 1):
+                            for dc in range(-r_soft, r_soft + 1):
+                                dist_sq = dr*dr + dc*dc
+                                if dist_sq <= r_soft*r_soft:
                                     nr, nc = row + dr, col + dc
                                     if 0 <= nr < self.rows and 0 <= nc < self.cols:
-                                        if self.grid[nr, nc] < 2:
-                                            self.grid[nr, nc] = 2  # Safety buffer
+                                        if dist_sq <= r_solid*r_solid:
+                                            if self.grid[nr, nc] != 3 and self.grid[nr, nc] != 2:
+                                                self.grid[nr, nc] = 2  # Hard buffer
+                                        else:
+                                            if self.grid[nr, nc] == 1:
+                                                self.grid[nr, nc] = 4  # Soft buffer
             
             logger.info("Successfully loaded and inflated map_estimate.png")
         except Exception as e:
@@ -423,67 +431,49 @@ class OccupancyGrid:
 
     def update_from_lidar(self, pose: Pose, lidar_data: List[float], max_range=3.5) -> bool:
         """
-        Update the dynamic map layer using lidar scan data.
-        
-        KEY DESIGN DECISION: Lidar can only ADD new obstacles to the map.
-        It NEVER removes obstacles from the static (PNG) layer. This prevents
-        lidar noise from erasing the pre-computed wall safety buffers.
-        
-        Returns True if any new obstacles were added.
+        DISABLED: Lidar dynamic obstacle marking was causing false positives
+        that blocked A* paths to victims. The pre-computed static map from
+        prepare_mission_plan.py already has all walls and corridors mapped.
+        Dynamic obstacles (furniture, victim bodies) should be navigated
+        around using the reactive IR/lidar avoidance in PurePursuit, not
+        by marking them into the grid map (which triggers expensive replanning).
         """
-        if not lidar_data:
-            return False
-        rx, ry, rtheta = pose
-        r_col, r_row = self.world_to_grid(rx, ry)
-        if not self.in_bounds(r_col, r_row):
-            return False
+        return False
 
-        n = len(lidar_data)
-        updated = False
+    def is_path_blocked(self, pose: Tuple[float, float, float], path: List[Coordinate], start_idx: int) -> bool:
+        """
+        Check if the path crosses a SOLID wall (value 3).
+        Uses Bresenham's line algorithm between waypoints to ensure we don't
+        step over 1-pixel thick dynamic obstacles detected by LIDAR.
+        """
+        if start_idx >= len(path): return False
         
-        # Process every 4th lidar ray (sufficient for 0.05m grid at typical ranges)
-        for i in range(0, n, 4):
-            dist = lidar_data[i]
+        for i in range(start_idx, len(path) - 1):
+            x0, y0 = self.world_to_grid(*path[i])
+            x1, y1 = self.world_to_grid(*path[i+1])
             
-            # Skip invalid readings
-            if math.isinf(dist) or math.isnan(dist):
-                continue
-            if dist >= max_range:
-                continue
-
-            # Compute hit point in world coordinates
-            # Lidar index 0 = rear of robot, sweeps CCW
-            angle = rtheta - math.pi + (2 * math.pi * i / n)
-            hit_x = rx + dist * math.cos(angle)
-            hit_y = ry + dist * math.sin(angle)
+            dx = abs(x1 - x0)
+            dy = abs(y1 - y0)
+            sx = 1 if x0 < x1 else -1
+            sy = 1 if y0 < y1 else -1
+            err = dx - dy
             
-            h_col, h_row = self.world_to_grid(hit_x, hit_y)
-            
-            # Mark the hit cell as obstacle IF it's not already known
-            if self.in_bounds(h_col, h_row):
-                if self.grid[h_row, h_col] < 2:
-                    self.grid[h_row, h_col] = 3
-                    updated = True
-                    # Inflate around the new dynamic obstacle
-                    r = self.inflation_radius_cells
-                    for dr in range(-r, r + 1):
-                        for dc in range(-r, r + 1):
-                            if dr*dr + dc*dc <= r*r:
-                                nr, nc = h_row + dr, h_col + dc
-                                if self.in_bounds(nc, nr) and self.grid[nr, nc] < 2:
-                                    self.grid[nr, nc] = 2
-
-        return updated
-
-    def is_path_blocked(self, path: List[Coordinate], start_idx: int) -> bool:
-        """
-        Check if any waypoint in the path crosses a SOLID wall (value 3).
-        Inflated buffers (2) do NOT invalidate the path since A* accounts for them.
-        """
-        for i in range(start_idx, len(path)):
-            c, r = self.world_to_grid(*path[i])
-            if self.in_bounds(c, r) and self.grid[r, c] == 3:
-                return True
+            while True:
+                if self.in_bounds(x0, y0):
+                    val = self.grid[y0, x0]
+                    if val == 3:
+                        return True
+                
+                if x0 == x1 and y0 == y1:
+                    break
+                e2 = 2 * err
+                if e2 > -dy:
+                    err -= dy
+                    x0 += sx
+                if e2 < dx:
+                    err += dx
+                    y0 += sy
+                    
         return False
 
 
@@ -550,8 +540,14 @@ class AStarPlanner:
                 if cell == 3:
                     continue
 
-                # Cost: inflated zones cost 5x more, encouraging center-of-hallway paths
-                traversal_cost = 5.0 if cell == 2 else 1.0
+                # Cost: inflated zones cost more, strongly repelling the robot
+                # from walls while still allowing passage through bottlenecks like doors.
+                traversal_cost = 1.0
+                if cell == 2:
+                    traversal_cost = 20.0
+                elif cell == 4:
+                    traversal_cost = 5.0
+                    
                 new_cost = cost_so_far[current] + move_cost * traversal_cost
 
                 if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
@@ -571,7 +567,7 @@ class AStarPlanner:
                     min_dist = d
                     best = node
             if best is None:
-                return [goal_world]
+                return []
             goal = best
 
         # Reconstruct path from goal back to start
@@ -583,7 +579,7 @@ class AStarPlanner:
         path_grid.reverse()
 
         if not path_grid:
-            return [goal_world]
+            return []
 
         # Convert grid path to world coordinates
         path = [self.grid_map.grid_to_world(*p) for p in path_grid]
@@ -603,7 +599,7 @@ class AStarPlanner:
         queue = deque([goal])
         while queue:
             c, r = queue.popleft()
-            if self.grid_map.grid[r, c] < 2:  # Free or unknown
+            if self.grid_map.grid[r, c] in (0, 1, 4):  # Free, unknown, or soft buffer
                 return (c, r)
             for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
                 nc, nr = c+dx, r+dy
@@ -615,9 +611,10 @@ class AStarPlanner:
     def _line_of_sight(self, p1: Tuple[int, int], p2: Tuple[int, int]) -> bool:
         """
         Check if a straight line between two grid cells is obstacle-free.
-        Only rejects paths through solid walls (3).
-        Allows passing through inflated zones (2) since the robot CAN fit through
-        doorways — it just shouldn't PLAN to drive there unless necessary.
+        Rejects paths through BOTH solid walls (3) and inflated zones (2).
+        This ensures that path smoothing NEVER cuts corners over safety buffers.
+        If a path MUST go through an inflated zone (like a doorway), A* will route
+        it node-by-node, and this function will preserve those careful waypoints.
         """
         x0, y0 = p1
         x1, y1 = p2
@@ -628,8 +625,9 @@ class AStarPlanner:
         err = dx - dy
         while x0 != x1 or y0 != y1:
             if self.grid_map.in_bounds(x0, y0):
-                if self.grid_map.grid[y0, x0] == 3:
-                    return False  # Blocked by solid wall
+                cell = self.grid_map.grid[y0, x0]
+                if cell == 2 or cell == 3:
+                    return False  # Blocked by wall or hard safety buffer
             e2 = 2 * err
             if e2 > -dy:
                 err -= dy
@@ -701,7 +699,7 @@ class PurePursuitController:
     KEY DESIGN: Avoidance is completely DISABLED within 1.2m of the victim
     target, since the "obstacle" detected at close range IS the victim body.
     """
-    def __init__(self, lookahead: float = 0.25):
+    def __init__(self, lookahead: float = 0.20):
         self.lookahead = lookahead
 
     def get_velocity(self, robot_pose: Pose, target: Coordinate,
@@ -730,12 +728,16 @@ class PurePursuitController:
 
         dist = math.hypot(target[0] - rx, target[1] - ry)
 
-        # Turn in place if heading error > 45° and target is not trivially close
-        if abs(alpha) > math.pi / 4 and dist > 0.20:
-            return 0.0, (2.5 if alpha > 0 else -2.5)
+        # Never stop completely to turn in place — always maintain some forward
+        # motion so the stuck-detection watchdog sees progress.
+        # For large heading errors (> 90°): move very slowly while spinning fast.
+        # For medium errors (45-90°): move slowly while correcting.
+        if abs(alpha) > math.pi / 2 and dist > 0.20:
+            # Large turn needed: crawl forward (avoids walls) + spin aggressively
+            return 0.08, (2.8 if alpha > 0 else -2.8)
 
-        # Base cruising speed
-        v = 0.35
+        # Base cruising speed (increased for faster mission completion)
+        v = 0.40
 
         # Pure Pursuit geometric curvature
         L = max(dist, self.lookahead)
@@ -743,71 +745,37 @@ class PurePursuitController:
 
         # Slow down on sharp curves for stability
         if abs(alpha) > math.pi / 8:
-            v = 0.20
+            v = 0.25
 
         # =============================================================
         # APPROACH MODE: When close to the victim target, DISABLE all
         # obstacle avoidance. The "obstacle" the sensors see IS the victim.
-        # Just drive straight to it at a moderate speed.
+        # Drive straight toward it at reduced speed.
         # =============================================================
-        if dist_to_goal < 1.2:
-            # Slow down gently for the final approach, but keep moving
-            v = 0.20
+        if dist_to_goal < 1.5:
+            v = 0.18
             return v, omega
 
         # =============================================================
         # PROACTIVE OBSTACLE AVOIDANCE (using front IR sensors)
-        # Only triggers within 20cm — gentle enough to not slow hallway travel
+        # Only triggers within 25cm — gentle enough to not slow hallway travel
         # =============================================================
         min_front = min(fl_dist, fr_dist)
 
-        if min_front < 0.20:
+        if min_front < 0.30:
             # Close obstacle: slow down proportionally
-            # 0.20m -> 70% speed, 0.08m -> near minimum
-            speed_factor = max(0.3, (min_front - 0.05) / 0.15)
+            speed_factor = max(0.3, (min_front - 0.05) / 0.25)
             v *= speed_factor
 
             # Steer AWAY from the closer obstacle
-            avoidance_strength = 1.5 * (1.0 - min_front / 0.20)
+            avoidance_strength = 2.5 * (1.0 - min_front / 0.30)
             if fl_dist < fr_dist:
                 omega -= avoidance_strength  # Turn right (away from left obstacle)
             else:
                 omega += avoidance_strength  # Turn left (away from right obstacle)
 
-        # =============================================================
-        # LIDAR-BASED FRONT NARROW CHECK (±15° arc only)
-        # Only checks for obstacles directly ahead, not side walls.
-        # =============================================================
-        if lidar_data and len(lidar_data) > 0:
-            n = len(lidar_data)
-            # Narrow front arc: ±15° (±n/24 indices) to avoid triggering on side walls
-            arc_half = n // 24
-            center = n // 2
-            front_left_min = 2.0
-            front_right_min = 2.0
-
-            for i in range(center - arc_half, center + arc_half):
-                idx = i % n
-                d = lidar_data[idx]
-                if math.isinf(d) or math.isnan(d):
-                    continue
-                if i < center:
-                    front_right_min = min(front_right_min, d)
-                else:
-                    front_left_min = min(front_left_min, d)
-
-            lidar_min_front = min(front_left_min, front_right_min)
-            if lidar_min_front < 0.18:
-                # Very close obstacle directly ahead — reduce speed and steer
-                v = min(v, 0.15)
-                steer = 1.2 * (1.0 - lidar_min_front / 0.18)
-                if front_left_min < front_right_min:
-                    omega -= steer
-                else:
-                    omega += steer
-
         # Enforce minimum speed floor to prevent crawling through corridors
-        v = max(v, 0.12)
+        v = max(v, 0.15)
 
         return v, omega
 
@@ -993,6 +961,18 @@ class AutonomousSARController:
             "target": [target[0], target[1]]
         })
 
+    def _abandon_victim(self, target: Coordinate):
+        """Release a victim claim so partner can try it."""
+        if self.assigned_victim == target:
+            self.assigned_victim = None
+        if self.hardware.robot_id in self.claimed_victims:
+            del self.claimed_victims[self.hardware.robot_id]
+        self.hardware.send_squad_message({
+            "type": "abandon_victim",
+            "robot_id": self.hardware.robot_id,
+            "target": [target[0], target[1]]
+        })
+
     def _broadcast_victim_found(self, victim_id: str, pose: Pose, target: Coordinate):
         """Notify partner robot that a victim has been found.
         NOTE: Do NOT send a score message here — that's already done
@@ -1022,6 +1002,10 @@ class AutonomousSARController:
                 if target_coord:
                     self.claimed_victims[sender] = (target_coord[0], target_coord[1])
                     logger.info(f"[{self.hardware.get_time():.1f}s][{self.hardware.robot_id}] SQUAD RX: Partner {sender} claimed {target_coord}")
+            elif mtype == "abandon_victim":
+                if sender in self.claimed_victims:
+                    del self.claimed_victims[sender]
+                logger.info(f"[{self.hardware.get_time():.1f}s][{self.hardware.robot_id}] SQUAD RX: Partner {sender} abandoned a victim")
 
     def _plan_path(self, pose: Pose, target: Coordinate) -> List[Coordinate]:
         """Plan an A* path and log the result."""
@@ -1117,6 +1101,20 @@ class AutonomousSARController:
                         self.state = "STOP"
                         continue
 
+                if not self.current_path:
+                    logger.warning(f"[{t:.1f}s][{self.hardware.robot_id}] Path is empty (unreachable victim)! Abandoning.")
+                    self.visited_victims.add(target)
+                    next_target = self._select_next_victim(pose)
+                    if next_target:
+                        self._claim_victim(next_target)
+                        self.current_path = self._plan_path(pose, next_target)
+                        self.path_idx = 0
+                        target = self.assigned_victim
+                        self.stuck_replan_count = 0
+                    else:
+                        self.state = "STOP"
+                    continue
+
                 dist_to_target = math.hypot(pose[0] - target[0], pose[1] - target[1])
 
                 # Log path for post-analysis
@@ -1130,83 +1128,102 @@ class AutonomousSARController:
 
                 # ==========================================================
                 # VICTIM DETECTION & SCORING
-                # Strategy:
-                # - Send periodic STATUS messages (victim_found=False) as heartbeat
-                # - Send ONE definitive SCORE message (victim_found=True) when
-                #   within 0.7m (by odometry), giving margin for odometry drift
-                # - Keep driving toward victim until 0.3m then stop and advance
-                #
-                # CONFIDENCE SCORING: score = correct_verdicts / total_victim_found
-                # Sending fewer, more accurate victim_found=True messages → higher confidence
+                # The supervisor uses the REAL Webots position of the robot
+                # and checks if it's within 1.0m of a victim marker.
+                # Our odometry may drift, so we use a GENEROUS 1.2m threshold
+                # to ensure we actually stop within the supervisor's 1.0m zone.
+                # If within 1.5m, we switch to direct-drive mode (ignore path)
+                # and approach the victim directly without avoidance.
                 # ==========================================================
-                
+
                 # Send periodic status heartbeat (every 100 ticks ≈ 3.2s)
-                # These have victim_found=False so they DON'T hurt confidence
                 if self.tick_counter % 100 == 0:
                     self.hardware.send_status_message(
                         self.hardware.robot_id,
                         [pose[0], pose[1]]
                     )
-                
-                # Victim approach zone: within 0.7m by odometry
-                if dist_to_target < 0.7:
-                    # Send exactly ONE victim_found=True score message
-                    # Only send if we haven't already scored this victim
-                    if target not in self.visited_victims:
-                        self.hardware.send_score_message(
-                            self.hardware.robot_id,
-                            [target[0], target[1], 1.0]
-                        )
-                        logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] SCORE MSG SENT for ({target[0]:.2f},{target[1]:.2f}) | Dist: {dist_to_target:.2f}m")
 
-                # Stop and advance to next victim when very close
-                if dist_to_target < 0.3:
-                    self.hardware.set_motor_speeds(0.0, 0.0)
-                    self.visited_victims.add(target)
+                # When within 1.5m of victim: ignore path, drive direct
+                if dist_to_target <= 1.5:
+                    # Override path following with direct approach
+                    v_direct, omega_direct = self.pursuit.get_velocity(
+                        pose, target, 2.0, 2.0, None, dist_to_goal=dist_to_target)
+                    self.hardware.set_motor_speeds(v_direct, omega_direct)
 
-                    victim_idx = self.victims.index(target) + 1 if target in self.victims else len(self.visited_victims)
-                    self._broadcast_victim_found(f"victim{victim_idx}", pose, target)
-                    logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] VICTIM SCORED! victim{victim_idx} at ({target[0]:.2f},{target[1]:.2f}) | Dist: {dist_to_target:.2f}m")
+                    # Stop and score when within 0.60m (generous margin for drift)
+                    if dist_to_target <= 0.60:
+                        self.hardware.set_motor_speeds(0.0, 0.0)
 
-                    # Select next victim
-                    next_target = self._select_next_victim(pose)
-                    if next_target:
-                        self._claim_victim(next_target)
-                        self.current_path = self._plan_path(pose, next_target)
-                        self.path_idx = 0
-                        self.stuck_replan_count = 0
-                        self.recovery_count = 0
-                        logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] Next target: {next_target}")
-                    else:
-                        logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] All victims found! -> STOP")
-                        self.state = "STOP"
+                        if target not in self.visited_victims:
+                            self.hardware.send_score_message(
+                                self.hardware.robot_id,
+                                [target[0], target[1], 1.0]
+                            )
+                            self.visited_victims.add(target)
+                            victim_idx = self.victims.index(target) + 1 if target in self.victims else len(self.visited_victims)
+                            self._broadcast_victim_found(f"victim{victim_idx}", pose, target)
+                            logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] VICTIM SCORED! victim{victim_idx} at ({target[0]:.2f},{target[1]:.2f}) | Dist: {dist_to_target:.2f}m")
+
+                        next_target = self._select_next_victim(pose)
+                        if next_target:
+                            self._claim_victim(next_target)
+                            self.current_path = self._plan_path(pose, next_target)
+                            self.path_idx = 0
+                            self.stuck_replan_count = 0
+                            self.recovery_count = 0
+                            logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] Next target: {next_target}")
+                        else:
+                            logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] All victims found! -> STOP")
+                            self.state = "STOP"
+                        continue
+
+                    # Still approaching: skip stuck detection and collision recovery
+                    # (sensors detect victim body as obstacle — don't trigger recovery!)
                     continue
 
                 # ==========================================================
                 # STUCK DETECTION WATCHDOG
-                # If the robot hasn't moved > 0.15m in the last 80 ticks
-                # (~2.5 seconds), it's stuck. Force a recovery maneuver
+                # If the robot hasn't moved > 0.15m in the last 60 ticks
+                # (~2.0 seconds), it's stuck. Force a recovery maneuver
                 # (reverse + spin) and replan from the new position.
                 # ==========================================================
-                if self.tick_counter - self.last_progress_tick > 80:
+                # If robot hasn't moved > 0.25m in the last 120 ticks (~3.8s), it's stuck.
+                # 120 ticks gives enough time for a 180° turn to complete before triggering.
+                if self.tick_counter - self.last_progress_tick > 120:
                     moved = math.hypot(
                         pose[0] - self.last_progress_pos[0],
                         pose[1] - self.last_progress_pos[1]
                     )
-                    if moved < 0.15:
-                        # STUCK! Force recovery
+                    if moved < 0.25:
                         self.stuck_replan_count += 1
-                        logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] STUCK DETECTED! Moved only {moved:.2f}m in 80 ticks. Forcing recovery #{self.stuck_replan_count}")
+                        logger.warning(f"[{t:.1f}s][{self.hardware.robot_id}] STUCK #{self.stuck_replan_count} at ({pose[0]:.2f},{pose[1]:.2f})")
+                        
+                        # After many recovery attempts: abandon this victim and try next
+                        if self.stuck_replan_count > 3 and self.assigned_victim:
+                            logger.warning(f"[{t:.1f}s][{self.hardware.robot_id}] Abandoning victim after 3 failed recoveries!")
+                            self._abandon_victim(self.assigned_victim)
+                            # Let partner try it by NOT adding to visited
+                            next_target = self._select_next_victim(pose)
+                            if next_target:
+                                self._claim_victim(next_target)
+                                self.current_path = self._plan_path(pose, next_target)
+                                self.path_idx = 0
+                                self.stuck_replan_count = 0
+                                target = next_target
+                            else:
+                                self.state = "STOP"
+                                continue
 
                         # Alternate spin direction each time to avoid repeating the same dead end
                         self.recovery_direction = 1.0 if (self.stuck_replan_count % 2 == 0) else -1.0
-                        self.recovery_timer = 35  # Longer recovery: more reverse + spin
+                        self.recovery_timer = 45  # Longer recovery: more reverse + spin
                         self.state = "RECOVERY"
                         continue
                     else:
-                        # Made progress — reset watchdog
+                        # Made progress: update watchdog
                         self.last_progress_pos = (pose[0], pose[1])
                         self.last_progress_tick = self.tick_counter
+                        self.stuck_replan_count = 0
 
                 # ==========================================================
                 # HARD COLLISION RECOVERY (IR sensors)
@@ -1241,15 +1258,9 @@ class AutonomousSARController:
                     logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] -> RECOVERY #{self.recovery_count} | fl={fl:.2f} fr={fr:.2f} | timer={self.recovery_timer}")
                     continue
 
-                # --- Lidar map update (every 20 ticks ≈ 0.64s, after initial settling) ---
-                if self.tick_counter > 30 and self.tick_counter % 20 == 0:
-                    new_obstacles = self.grid_map.update_from_lidar(pose, lidar)
-
-                    # Check if current path is still valid
-                    if self.current_path and new_obstacles:
-                        if self.grid_map.is_path_blocked(self.current_path, self.path_idx):
-                            self.current_path = self._plan_path(pose, target)
-                            self.path_idx = 0
+                # --- Lidar map update DISABLED (see update_from_lidar docstring) ---
+                # Dynamic obstacle detection caused false positives blocking victim paths.
+                # Reactive avoidance in PurePursuit handles real-time obstacles.
 
                 # --- Ensure we have a path ---
                 if not self.current_path:
@@ -1257,14 +1268,17 @@ class AutonomousSARController:
                     self.path_idx = 0
 
                 # --- Follow the path using Pure Pursuit ---
+                # When far from victim, follow the A* path waypoint by waypoint.
+                # When within 1.5m (handled above), we already switched to direct approach.
                 v_cmd, omega_cmd = 0.0, 0.0
                 if self.current_path and self.path_idx < len(self.current_path):
-                    waypoint = self.current_path[self.path_idx]
-                    w_dist = math.hypot(pose[0] - waypoint[0], pose[1] - waypoint[1])
-
-                    # Advance to next waypoint if close enough
-                    if w_dist < 0.15:
-                        self.path_idx += 1
+                    # Advance waypoints: skip any waypoint within 0.30m
+                    while self.path_idx < len(self.current_path) - 1:
+                        wp = self.current_path[self.path_idx]
+                        if math.hypot(pose[0] - wp[0], pose[1] - wp[1]) < 0.30:
+                            self.path_idx += 1
+                        else:
+                            break
 
                     if self.path_idx < len(self.current_path):
                         waypoint = self.current_path[self.path_idx]
@@ -1275,7 +1289,7 @@ class AutonomousSARController:
                         v_cmd, omega_cmd = self.pursuit.get_velocity(
                             pose, target, fl, fr, lidar, dist_to_target)
                 else:
-                    # No path available, drive toward target
+                    # No path available, drive toward target directly
                     v_cmd, omega_cmd = self.pursuit.get_velocity(
                         pose, target, fl, fr, lidar, dist_to_target)
 
@@ -1297,7 +1311,7 @@ class AutonomousSARController:
                 self.recovery_timer -= 1
 
                 if self.recovery_timer > 0:
-                    if self.recovery_timer > 15:
+                    if self.recovery_timer > 20:
                         # Phase 1: Reverse straight (clears the obstacle)
                         self.hardware.set_motor_speeds(-0.40, 0.0)
                     else:

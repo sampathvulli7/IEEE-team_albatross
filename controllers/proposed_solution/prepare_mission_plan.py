@@ -152,8 +152,8 @@ def main():
     #   3. Map: img_x = (wx - world_min_x) / resolution
     #           img_y = (world_max_y - wy) / resolution  (Y-axis flipped)
     # ================================================================
-    map_width = 1000   # Same as supervisor default
-    map_height = 1000
+    map_width = 600   # Same as supervisor default
+    map_height = 600
     resolution = 0.05  # Same as supervisor default
     
     # Victim marker body offsets (from PROTO geometry analysis)

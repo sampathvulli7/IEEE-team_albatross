@@ -1,7 +1,7 @@
 {
-  "width": 1000,
-  "height": 1000,
+  "width": 600,
+  "height": 600,
   "resolution": 0.05,
-  "world_min_x": -31.200000000007083,
-  "world_max_y": 18.4400035813751
+  "world_min_x": -21.200000000007083,
+  "world_max_y": 8.440003581375104
 }
