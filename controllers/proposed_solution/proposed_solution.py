@@ -1172,20 +1172,34 @@ class AutonomousSARController:
                     self.last_progress_pos = (pose[0], pose[1])
                     self.last_progress_tick = self.tick_counter
 
-                    # ---- SCORING PULSES: send while physically at victim ----
+                    # ---- SCORING PULSES: two phases after physically reaching victim ----
+                    # Phase 1 (ticks 80→21): robot is STOPPED, sends score pulses every
+                    #   8 ticks so the supervisor's real-position check fires multiple times.
+                    # Phase 2 (ticks 20→1): robot REVERSES ~0.14m to clear the victim body,
+                    #   ensuring the next A* plan starts from free (unobstructed) space.
+                    #   This is critical for robot2: victim1 is only 1.4m from victim2 and
+                    #   the robot needs a clear exit to navigate there immediately after.
                     if self.scoring_pulse_timer > 0:
-                        self.hardware.set_motor_speeds(0.0, 0.0)
                         self.scoring_pulse_timer -= 1
-                        # Send a score pulse every 8 ticks
-                        if self.tick_counter % 8 == 0:
-                            self.hardware.send_score_message(
-                                self.hardware.robot_id,
-                                [target[0], target[1], 1.0]
-                            )
-                            self.scoring_pulse_count += 1
+
+                        if self.scoring_pulse_timer > 20:
+                            # Phase 1: stay stopped, send score pulses
+                            self.hardware.set_motor_speeds(0.0, 0.0)
+                            if self.tick_counter % 8 == 0:
+                                self.hardware.send_score_message(
+                                    self.hardware.robot_id,
+                                    [target[0], target[1], 1.0]
+                                )
+                                self.scoring_pulse_count += 1
+                        else:
+                            # Phase 2: reverse gently to clear victim body
+                            # ~20 ticks × 32ms × 0.22 m/s ≈ 0.14m of clearance
+                            self.hardware.set_motor_speeds(-0.22, 0.0)
+
                         if self.scoring_pulse_timer <= 0:
-                            # All pulses sent, move on to next victim
-                            logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] Scoring complete ({self.scoring_pulse_count} pulses). Moving on.")
+                            # Both phases complete — stop motors, then plan next victim
+                            self.hardware.set_motor_speeds(0.0, 0.0)
+                            logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] Scoring complete ({self.scoring_pulse_count} pulses). Body cleared. Moving on.")
                             self.scoring_pulse_timer = 0
                             self.scoring_pulse_count = 0
                             self.scoring_victim = None
@@ -1204,8 +1218,9 @@ class AutonomousSARController:
 
                     # ---- APPROACH: drive directly toward victim ----
                     # Stop when IR sensor < 0.20m (physically touching victim body)
-                    # or when odometry says <= 0.35m (failsafe for non-solid victims)
-                    at_victim = (fl < 0.20 or fr < 0.20 or dist_to_target <= 0.35)
+                    # or when odometry says <= 0.20m (tight failsafe — avoids false-positive
+                    # score messages from odometry drift, keeping confidence score near 1.0)
+                    at_victim = (fl < 0.20 or fr < 0.20 or dist_to_target <= 0.20)
 
                     if at_victim:
                         self.hardware.set_motor_speeds(0.0, 0.0)
