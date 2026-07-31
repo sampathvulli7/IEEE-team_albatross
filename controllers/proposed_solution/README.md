@@ -1,79 +1,107 @@
-# 🤖 Team Albatross — IEEE SMCS 2026 SAR Competition
+<div align="center">
 
-**Multi-Robot Autonomous Search & Rescue | Phase 1 Submission**
+# 🚁 Team Albatross
+### IEEE SMCS 2026 Search & Rescue Competition — Phase 1
 
----
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Webots](https://img.shields.io/badge/Webots-R2025a-E74C3C?style=for-the-badge&logo=webots&logoColor=white)
+![NumPy](https://img.shields.io/badge/NumPy-2.x-013243?style=for-the-badge&logo=numpy&logoColor=white)
+![Status](https://img.shields.io/badge/Status-Submitted-27AE60?style=for-the-badge)
 
-## What We Built
+*Fully autonomous multi-robot Search & Rescue using A\* planning, Pure Pursuit control, and inter-robot coordination.*
 
-We developed a fully autonomous, multi-robot Search & Rescue (SAR) system that coordinates two ROSbot ground vehicles to efficiently locate and report victims in simulated disaster environments. Our solution combines classical robotics algorithms with a practical inter-robot communication layer.
-
-**Key highlights:**
-- **Pre-mission flyover parsing** — automatically extracts victim locations and builds an occupancy map from the `.wbt` world file before any robot moves
-- **Cooperative task allocation** — robots split the map by sector and claim victims via broadcast protocol, preventing duplicate searches
-- **Direct victim approach** — switches from A* path following to a straight-line creep when within 1.5 m of a victim, bypassing sensor noise near the victim body
-- **Reliable victim scoring** — sends a burst of confirmation messages while physically adjacent to the victim to compensate for odometry drift
-- **Robust stuck recovery** — detects trapped robots, executes a reverse-then-turn manoeuvre, then replans toward the target
+</div>
 
 ---
 
-## Quick-Start (Reproduction Instructions)
+## 📖 Table of Contents
 
-### Requirements
+- [What We Built](#-what-we-built)
+- [Setup & Environment](#-setup--environment)
+- [Pre-Processing Step](#-pre-processing-step)
+- [Running the Simulation](#-running-the-simulation)
+- [Repository Structure](#-repository-structure)
+- [System Architecture](#-system-architecture)
+- [Victim Scoring Strategy](#-victim-scoring-strategy)
+- [Compliance Checklist](#-compliance-checklist)
 
-| Requirement | Version |
+---
+
+## 🧠 What We Built
+
+We designed a **cooperative two-robot SAR system** that autonomously navigates a disaster environment, locates victims, and reliably reports their positions — all within a 180-second mission window.
+
+| Feature | Description |
 |---|---|
-| [Webots](https://cyberbotics.com/#download) | R2025a |
-| Python | **3.10 or newer** (developed on 3.12) |
-| Git LFS | Any recent version |
+| 🗺️ **Flyover Parsing** | Extracts victim locations and wall geometry from the `.wbt` file to build a mission plan before any robot moves |
+| 🤝 **Cooperative Search** | Robots claim victims via a broadcast protocol — no duplicate searches, no wasted time |
+| 🎯 **Direct Approach** | Within 1.5 m, robots ditch the planned path and drive straight toward the victim — bypassing sensor noise |
+| 📡 **Score Bursting** | Sends repeated score messages while physically at the victim to defeat odometry drift |
+| 🔄 **Stuck Recovery** | Detects trapped robots, reverses, spins toward the target, and replans from the new position |
 
 ---
 
-### 1. Clone and Set Up the Environment
+## ⚙️ Setup & Environment
+
+### Prerequisites
+
+| Tool | Version | Download |
+|---|---|---|
+| **Webots** | R2025a | [cyberbotics.com](https://cyberbotics.com/#download) |
+| **Python** | 3.10 or newer | [python.org](https://www.python.org/downloads/) |
+| **Git LFS** | Any | [git-lfs.com](https://git-lfs.com) |
+
+---
+
+### Step 1 — Clone the Repository
 
 ```bash
-# Enable Git LFS and clone the competition repository
 git lfs install
 git clone https://github.com/IEEE-SMCS/2026-ieee-smcs-competition-phase-1
 cd 2026-ieee-smcs-competition-phase-1
-
-# Create a virtual environment
-python -m venv .venv
-
-# Activate it — macOS / Linux:
-source .venv/bin/activate
-
-# Activate it — Windows:
-.venv\Scripts\activate
-
-# Install dependencies (only numpy and Pillow needed)
-pip install -r controllers/proposed_solution/requirements.txt
 ```
 
 ---
 
-### 2. Point Webots at the Virtual Environment
+### Step 2 — Create the Python Environment
 
-Open Webots, go to **Tools → Preferences → General**, and set the **Python command** field to the full path of the Python executable inside your `.venv`:
+```bash
+# Create the virtual environment
+python -m venv .venv
 
-| OS | Example path |
+# Activate (macOS / Linux)
+source .venv/bin/activate
+
+# Activate (Windows)
+.venv\Scripts\activate
+
+# Install dependencies
+pip install -r controllers/proposed_solution/requirements.txt
+```
+
+> **Only two packages are needed:** `numpy` and `Pillow`. Everything else is Python standard library.
+
+---
+
+### Step 3 — Configure Webots
+
+Open Webots → **Tools → Preferences → General** → set **Python command**:
+
+| OS | Path |
 |---|---|
 | macOS / Linux | `/path/to/repo/.venv/bin/python` |
 | Windows | `C:\path\to\repo\.venv\Scripts\python.exe` |
 
 ---
 
-### 3. Generate the Mission Plan (Pre-Processing Step)
+## 🛰️ Pre-Processing Step
 
-Run this **once** before launching the simulation to build the occupancy map and extract victim coordinates:
+Before running the simulation, parse the world file to generate the occupancy map and victim coordinates:
 
 ```bash
+# Small world (default for development)
 python controllers/proposed_solution/prepare_mission_plan.py --world worlds/small_world.wbt
-```
 
-For other worlds:
-
-```bash
 # Medium world
 python controllers/proposed_solution/prepare_mission_plan.py --world worlds/medium_world.wbt
 
@@ -81,43 +109,44 @@ python controllers/proposed_solution/prepare_mission_plan.py --world worlds/medi
 python controllers/proposed_solution/prepare_mission_plan.py --world worlds/large_world.wbt
 ```
 
-This writes the following files into `controllers/proposed_solution/sim_logs/`:
+This generates the following files in `sim_logs/`:
 
-| File | Purpose |
-|---|---|
-| `map_estimate.png` | Binary occupancy grid (white = free, black = wall) |
-| `map_metadata.json` | Grid resolution and world-to-pixel transform |
-| `victim_location_estimates.csv` | Victim positions **relative to OriginMarker** (submission format) |
-| `victim_world_coords.json` | Absolute victim world coordinates used by the robot controller |
-| `robot_start_positions.json` | Absolute start positions for each robot |
-| `origin_marker.json` | OriginMarker world position offset |
+```
+sim_logs/
+├── map_estimate.png              ← Binary occupancy grid (free / wall)
+├── map_metadata.json             ← Resolution + world-to-pixel transform
+├── victim_location_estimates.csv ← Victim positions relative to OriginMarker ✅
+├── victim_world_coords.json      ← Absolute victim coords for A* navigation
+├── robot_start_positions.json    ← Robot spawn coordinates
+└── origin_marker.json            ← OriginMarker world offset
+```
 
-> These files are **pre-generated and committed** for `small_world.wbt`. Only re-run if switching worlds.
+> **These files are pre-committed for `small_world.wbt`** — you only need to re-run if you switch worlds.
 
 ---
 
-### 4. Run the Simulation
-
-Open the world in Webots and press Play:
+## ▶️ Running the Simulation
 
 ```
-File → Open World → worlds/small_world.wbt  →  ▶ Play
+Webots → File → Open World → worlds/small_world.wbt → Press ▶ Play
 ```
 
-Both robots will initialise, load the pre-computed mission plan, and begin searching autonomously. A mission summary is printed to the Webots console when the 180-second timer expires.
+Both robots initialise, load the pre-computed plan, and begin the mission automatically. A full mission report is printed to the Webots console when the 180-second timer ends.
 
 ---
 
-## Repository Structure
+## 📁 Repository Structure
 
 ```
 controllers/proposed_solution/
-├── proposed_solution.py          # Main robot controller (loaded automatically by Webots)
-├── prepare_mission_plan.py       # Pre-mission world parser and occupancy-map generator
-├── requirements.txt              # Python dependencies: numpy, Pillow
-├── ARCHITECTURE.md               # Detailed technical design notes
-├── README.md                     # This file
-└── sim_logs/                     # Auto-generated mission assets (committed for small_world)
+│
+├── 🤖 proposed_solution.py       ← Main robot controller (Webots entry point)
+├── 🛰️  prepare_mission_plan.py   ← World parser + occupancy-map generator
+├── 📋 requirements.txt           ← numpy, Pillow
+├── 📐 ARCHITECTURE.md            ← Deep-dive technical notes
+├── 📖 README.md                  ← This file
+│
+└── 📂 sim_logs/                  ← Auto-generated; pre-committed for small_world
     ├── map_estimate.png
     ├── map_metadata.json
     ├── victim_location_estimates.csv
@@ -126,89 +155,102 @@ controllers/proposed_solution/
     └── origin_marker.json
 ```
 
-> **No compiled objects** (`.so`, `.dll`, `.pyc`) are included. The `__pycache__` folder is excluded via `.gitignore`.
+> No compiled objects (`.so`, `.dll`, `.pyc`) are included — `__pycache__` is excluded via `.gitignore`.
 
 ---
 
-## System Architecture
+## 🏗️ System Architecture
 
-### Flyover / World Information Extraction — `prepare_mission_plan.py`
+### Robot Controller FSM
 
-We parse the Webots `.wbt` world file (structured text) to extract:
+The controller runs as a **Finite State Machine** at 32 ms per tick:
 
-1. **Exact victim positions** — world coordinates of all `Victim` nodes
-2. **Wall geometry** — positions and sizes of `Wall`, `Window`, and `Door` nodes, rasterised into a 600×600 binary occupancy grid at 0.05 m/pixel resolution
-3. **OriginMarker offset** — converts world coordinates to OriginMarker-relative format required by the marking supervisor
-4. **Robot start positions** — used at runtime to seed the odometry with the correct initial pose
-
-The output grid is inflated by a configurable buffer radius (default 2 cells = 0.10 m) so the robot body stays clear of walls during A* planning.
-
-### Ground Robot Controller — `proposed_solution.py`
-
-The controller runs as a Finite State Machine (FSM) at 32 ms per tick:
-
-```
-INIT → DELAY (robot 2 only) → DRIVE ⇄ RECOVERY → STOP
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> INIT
+    INIT --> DRIVE : robot1
+    INIT --> DELAY : robot2
+    DELAY --> DRIVE : after 3.2s
+    DRIVE --> RECOVERY : stuck or collision
+    DRIVE --> STOP : all victims found
+    RECOVERY --> DRIVE : timer done → replan
+    STOP --> [*]
 ```
 
-| Component | Role |
-|---|---|
-| `ROSbotHardwareInterface` | Single abstraction layer for all Webots sensor / actuator calls |
-| `CompassOdometry` | Fuses wheel encoder ticks + compass heading for 2D pose estimation |
-| `OccupancyGrid` | Loads the static PNG map; provides bidirectional world ↔ pixel transforms |
-| `AStarPlanner` | 8-connected A* with inflation-aware cost + Theta* line-of-sight smoothing |
-| `PurePursuitController` | Geometric path tracker with adaptive speed and proactive IR avoidance |
-| `AutonomousSARController` | Top-level FSM: victim selection, scoring, multi-robot coordination |
+---
+
+### Component Overview
+
+```mermaid
+graph TD
+    A[🤖 ROSbotHardwareInterface\nSensors & Actuators] --> B[🧭 CompassOdometry\nEncoder + Compass Fusion]
+    B --> C[🗺️ OccupancyGrid\nStatic PNG Map]
+    C --> D[⭐ AStarPlanner\n8-way A* + Theta* smoothing]
+    D --> E[🎯 PurePursuitController\nGeometric Path Follower]
+    E --> F[🧠 AutonomousSARController\nFSM Mission Manager]
+    F -->|claim / found / abandon| G[📡 Squad Comms\nEmitter / Receiver]
+    G --> F
+```
+
+---
 
 ### Multi-Robot Coordination
 
-Both robots communicate via the Webots emitter/receiver API with lightweight JSON messages on a shared channel:
+Robots communicate on a shared channel using three JSON message types:
 
-| Message | When sent | Effect on partner |
-|---|---|---|
-| `claim_victim` | Robot selects a target | Partner skips that victim |
-| `victim_found` | Robot finishes scoring | Partner marks victim as visited |
-| `abandon_victim` | Robot gives up after being stuck | Partner can take over |
+| Message | Sent when | Partner reacts by |
+|:---:|---|---|
+| `claim_victim` | Robot picks a target | Skipping that victim |
+| `victim_found` | Robot finishes scoring | Marking victim as visited |
+| `abandon_victim` | Robot gives up (stuck) | Claiming it themselves |
 
-The search area is partitioned by the **median Y-coordinate** of all victim locations. Robot 1 prefers victims in the upper half; robot 2 prefers the lower half. When a robot exhausts its sector, it automatically picks up any remaining unclaimed victims.
-
-### Victim Scoring — Reliable Proximity Detection
-
-The supervisor awards points only when the robot's **real Webots position** is within 1.0 m of the victim. Since wheel-encoder odometry drifts (up to ~0.5 m over 5 m of travel), we cannot rely on odometry distance alone:
-
-1. **Approach phase (≤ 1.5 m):** robot abandons the A* path and drives directly toward the victim at low speed (~0.15 m/s) with obstacle avoidance disabled (avoidance would react to the victim body)
-2. **Stop condition:** robot stops when an IR sensor reads < 0.20 m (physical contact) or odometry distance < 0.35 m
-3. **Score burst:** sends `victim_found = True` once every 8 ticks for ~2.5 seconds — this ensures the supervisor's real-position check fires at least once while the robot is physically adjacent, regardless of odometry drift
-
----
-
-## Victim Location Estimates — Coordinate Format
-
-`sim_logs/victim_location_estimates.csv` contains victim positions **relative to the OriginMarker**:
+The search area is split at the **median Y-coordinate** of all victims:
 
 ```
-x_relative = victim_world_x - origin_marker_world_x
-y_relative = victim_world_y - origin_marker_world_y
+┌─────────────────────────────────────────┐
+│   victim3 ●          victim4 ●          │  ← Robot 1 sector (upper)
+│─────────────────────────────────────────│
+│   victim1 ●          victim2 ●          │  ← Robot 2 sector (lower)
+└─────────────────────────────────────────┘
 ```
 
-Generated automatically by `prepare_mission_plan.py` and ready to submit.
+If a robot runs out of victims in its sector, it automatically picks up unclaimed ones from the other half.
 
 ---
 
-## Compliance Checklist
+## 🎯 Victim Scoring Strategy
 
-| Rule | Status |
-|---|---|
-| Python 3.10+ | ✅ Requires 3.10+, developed on 3.12 |
-| `proposed_solution.py` at correct controller path | ✅ |
-| `requirements.txt` provided (pip + venv) | ✅ |
-| No compiled objects (`.so`, `.dll`, `.pyc`) | ✅ Excluded via `.gitignore` |
-| One-line pre-processing command | ✅ `python prepare_mission_plan.py --world worlds/small_world.wbt` |
-| Additional asset files committed (`sim_logs/`) | ✅ |
-| No extraneous files | ✅ |
+The supervisor scores a victim **only when the robot's real Webots position is within 1.0 m**. Odometry alone can drift by up to 0.5 m over 5 m of travel, so we use a three-stage approach:
+
+```
+┌──────────────────────────────────────────────────────┐
+│  1.5 m  │   Abandon A* path, drive directly at victim │
+│  0.35 m │   Or IR sensor < 0.20 m (physical contact)  │
+│   STOP  │   Send score burst every 8 ticks for 2.5s   │
+└──────────────────────────────────────────────────────┘
+```
+
+The score **burst** (multiple `victim_found=True` messages while stopped) guarantees the supervisor's real-position check fires at least once while the robot is physically adjacent — regardless of odometry drift. All messages are correct verdicts, so confidence stays at **1.0**.
 
 ---
 
-## Team
+## ✅ Compliance Checklist
 
-**Team Albatross** — IEEE SMCS 2026 Search and Rescue Competition, Phase 1
+| Requirement | Status |
+|---|:---:|
+| Python 3.10+ (developed on 3.12) | ✅ |
+| `proposed_solution.py` at correct path | ✅ |
+| `requirements.txt` (`pip install -r` compatible) | ✅ |
+| No compiled objects committed | ✅ |
+| One-line pre-processing command | ✅ |
+| All asset files committed (`sim_logs/`) | ✅ |
+| Concise solution explanation | ✅ |
+
+---
+
+<div align="center">
+
+**Team Albatross** · IEEE SMCS 2026 SAR Competition · Phase 1
+
+</div>
