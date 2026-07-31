@@ -848,6 +848,11 @@ class AutonomousSARController:
         self.recovery_count = 0         # Count consecutive recoveries
         self.last_recovery_tick = 0     # When last recovery happened
 
+        # --- Victim scoring state ---
+        self.scoring_victim: Optional[Coordinate] = None
+        self.scoring_pulse_timer = 0    # Ticks left to keep sending score pulses
+        self.scoring_pulse_count = 0    # How many pulses sent
+
         # --- Stuck detection watchdog ---
         self.last_progress_pos = (0.0, 0.0)   # Position at last progress check
         self.last_progress_tick = 0            # Tick when progress was last confirmed
@@ -1102,18 +1107,32 @@ class AutonomousSARController:
                         continue
 
                 if not self.current_path:
-                    logger.warning(f"[{t:.1f}s][{self.hardware.robot_id}] Path is empty (unreachable victim)! Abandoning.")
-                    self.visited_victims.add(target)
-                    next_target = self._select_next_victim(pose)
-                    if next_target:
-                        self._claim_victim(next_target)
-                        self.current_path = self._plan_path(pose, next_target)
-                        self.path_idx = 0
-                        target = self.assigned_victim
-                        self.stuck_replan_count = 0
+                    # Empty path usually means the robot's odometry-estimated position
+                    # is inside an inflation buffer (odometry drift pushed us into a wall cell).
+                    # Do a short escape: reverse 0.4m, then retry. 
+                    self.stuck_replan_count += 1
+                    if self.stuck_replan_count <= 2:
+                        logger.warning(f"[{t:.1f}s][{self.hardware.robot_id}] Empty path (robot in buffer zone?). Escaping...")
+                        # Reverse briefly to move to a free cell
+                        self.recovery_timer = 30  # ~1s reverse
+                        self.recovery_direction = 1.0
+                        self.state = "RECOVERY"
+                        continue
                     else:
-                        self.state = "STOP"
-                    continue
+                        # After 2 escape attempts, truly abandon this victim
+                        logger.warning(f"[{t:.1f}s][{self.hardware.robot_id}] Path is empty (unreachable victim)! Abandoning.")
+                        self.visited_victims.add(target)
+                        next_target = self._select_next_victim(pose)
+                        if next_target:
+                            self._claim_victim(next_target)
+                            self.current_path = self._plan_path(pose, next_target)
+                            self.path_idx = 0
+                            target = self.assigned_victim
+                            self.stuck_replan_count = 0
+                        else:
+                            self.state = "STOP"
+                        continue
+
 
                 dist_to_target = math.hypot(pose[0] - target[0], pose[1] - target[1])
 
@@ -1143,43 +1162,85 @@ class AutonomousSARController:
                         [pose[0], pose[1]]
                     )
 
-                # When within 1.5m of victim: ignore path, drive direct
+                # When within 1.5m of victim: ignore path, drive direct toward victim.
+                # Keep moving until the IR sensor detects the victim body (< 0.20m)
+                # or odometry distance < 0.35m as a fallback.
+                # Then send repeated score pulses every 8 ticks for ~2s so the
+                # supervisor's 1.0m proximity check triggers on the real position.
                 if dist_to_target <= 1.5:
-                    # Override path following with direct approach
-                    v_direct, omega_direct = self.pursuit.get_velocity(
-                        pose, target, 2.0, 2.0, None, dist_to_goal=dist_to_target)
-                    self.hardware.set_motor_speeds(v_direct, omega_direct)
+                    # Update stuck watchdog so it doesn't fire right after scoring
+                    self.last_progress_pos = (pose[0], pose[1])
+                    self.last_progress_tick = self.tick_counter
 
-                    # Stop and score when within 0.60m (generous margin for drift)
-                    if dist_to_target <= 0.60:
+                    # ---- SCORING PULSES: send while physically at victim ----
+                    if self.scoring_pulse_timer > 0:
                         self.hardware.set_motor_speeds(0.0, 0.0)
-
-                        if target not in self.visited_victims:
+                        self.scoring_pulse_timer -= 1
+                        # Send a score pulse every 8 ticks
+                        if self.tick_counter % 8 == 0:
                             self.hardware.send_score_message(
                                 self.hardware.robot_id,
                                 [target[0], target[1], 1.0]
                             )
-                            self.visited_victims.add(target)
-                            victim_idx = self.victims.index(target) + 1 if target in self.victims else len(self.visited_victims)
-                            self._broadcast_victim_found(f"victim{victim_idx}", pose, target)
-                            logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] VICTIM SCORED! victim{victim_idx} at ({target[0]:.2f},{target[1]:.2f}) | Dist: {dist_to_target:.2f}m")
-
-                        next_target = self._select_next_victim(pose)
-                        if next_target:
-                            self._claim_victim(next_target)
-                            self.current_path = self._plan_path(pose, next_target)
-                            self.path_idx = 0
-                            self.stuck_replan_count = 0
-                            self.recovery_count = 0
-                            logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] Next target: {next_target}")
-                        else:
-                            logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] All victims found! -> STOP")
-                            self.state = "STOP"
+                            self.scoring_pulse_count += 1
+                        if self.scoring_pulse_timer <= 0:
+                            # All pulses sent, move on to next victim
+                            logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] Scoring complete ({self.scoring_pulse_count} pulses). Moving on.")
+                            self.scoring_pulse_timer = 0
+                            self.scoring_pulse_count = 0
+                            self.scoring_victim = None
+                            next_target = self._select_next_victim(pose)
+                            if next_target:
+                                self._claim_victim(next_target)
+                                self.current_path = self._plan_path(pose, next_target)
+                                self.path_idx = 0
+                                self.stuck_replan_count = 0
+                                self.recovery_count = 0
+                                logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] Next target: {next_target}")
+                            else:
+                                logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] All victims found! -> STOP")
+                                self.state = "STOP"
                         continue
 
-                    # Still approaching: skip stuck detection and collision recovery
-                    # (sensors detect victim body as obstacle — don't trigger recovery!)
-                    continue
+                    # ---- APPROACH: drive directly toward victim ----
+                    # Stop when IR sensor < 0.20m (physically touching victim body)
+                    # or when odometry says <= 0.35m (failsafe for non-solid victims)
+                    at_victim = (fl < 0.20 or fr < 0.20 or dist_to_target <= 0.35)
+
+                    if at_victim:
+                        self.hardware.set_motor_speeds(0.0, 0.0)
+
+                        if target not in self.visited_victims:
+                            self.visited_victims.add(target)
+                            self.scoring_victim = target
+                            victim_idx = self.victims.index(target) + 1 if target in self.victims else len(self.visited_victims)
+                            self._broadcast_victim_found(f"victim{victim_idx}", pose, target)
+                            logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] AT VICTIM{victim_idx}! Sending score pulses. Dist(odo): {dist_to_target:.2f}m fl={fl:.2f} fr={fr:.2f}")
+                            # Start scoring pulses: 2.5s worth (~80 ticks at 32ms)
+                            self.scoring_pulse_timer = 80
+                            self.scoring_pulse_count = 0
+                        else:
+                            # Already scored, just move on
+                            next_target = self._select_next_victim(pose)
+                            if next_target:
+                                self._claim_victim(next_target)
+                                self.current_path = self._plan_path(pose, next_target)
+                                self.path_idx = 0
+                                self.stuck_replan_count = 0
+                                self.recovery_count = 0
+                                logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] Next target: {next_target}")
+                            else:
+                                logger.info(f"[{t:.1f}s][{self.hardware.robot_id}] All victims found! -> STOP")
+                                self.state = "STOP"
+                        continue
+
+                    # Still approaching: slow creep directly toward victim,
+                    # avoidance disabled (sensors might see victim body).
+                    # Angle correction only (no IR avoidance).
+                    v_direct, omega_direct = self.pursuit.get_velocity(
+                        pose, target, 2.0, 2.0, None, dist_to_goal=dist_to_target)
+                    self.hardware.set_motor_speeds(v_direct, omega_direct)
+                    continue  # Skip stuck detection and collision recovery
 
                 # ==========================================================
                 # STUCK DETECTION WATCHDOG
@@ -1313,10 +1374,19 @@ class AutonomousSARController:
                 if self.recovery_timer > 0:
                     if self.recovery_timer > 20:
                         # Phase 1: Reverse straight (clears the obstacle)
-                        self.hardware.set_motor_speeds(-0.40, 0.0)
+                        self.hardware.set_motor_speeds(-0.38, 0.0)
                     else:
-                        # Phase 2: Spin toward path direction
-                        self.hardware.set_motor_speeds(0.0, 3.5 * self.recovery_direction)
+                        # Phase 2: Spin toward the next target victim direction
+                        # This ensures we emerge facing the right way after recovery
+                        pose = self.odometry.get_pose()
+                        tgt = self.assigned_victim
+                        if tgt:
+                            desired_heading = math.atan2(tgt[1] - pose[1], tgt[0] - pose[0])
+                            heading_err = (desired_heading - pose[2] + math.pi) % (2 * math.pi) - math.pi
+                            spin = 3.5 if heading_err > 0 else -3.5
+                        else:
+                            spin = 3.5 * self.recovery_direction
+                        self.hardware.set_motor_speeds(0.0, spin)
                 else:
                     # Recovery done: replan from new position and resume driving
                     self.state = "DRIVE"

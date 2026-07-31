@@ -1,0 +1,5 @@
+# Python 3.10+ required (developed and tested on Python 3.12)
+# Install with:  pip install -r requirements.txt
+
+numpy>=1.26.0
+Pillow>=10.0.0
