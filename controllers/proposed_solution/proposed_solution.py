@@ -1225,15 +1225,15 @@ class AutonomousSARController:
                                 self.state = "STOP"
                         continue
 
-                    # ---- APPROACH: drive directly toward victim ----
-                    # Two-condition approach to avoid false triggers on walls/furniture:
-                    #   IR contact (fl or fr < 0.15m) is only valid when odometry also
-                    #   confirms we are within 1.0m of the victim — this prevents hitting
-                    #   a bed frame 1.5m from victim1 and falsely scoring it.
-                    #   The pure odometry fallback (<=0.20m) handles flat/non-solid victims
-                    #   like victim3 where IR doesn't detect the body at all.
-                    ir_contact = (fl < 0.15 or fr < 0.15)
-                    at_victim = (ir_contact and dist_to_target < 1.0) or dist_to_target <= 0.20
+                    # ---- APPROACH: drive toward victim following A* path ----
+                    # Two-condition trigger to prevent bed-frame / wall false positives:
+                    #   IR contact must be < 0.10m AND odometry must confirm the robot
+                    #   is within 0.60m of the victim. This blocks victim1's bed-frame
+                    #   trigger (fl/fr=0.04 but dist_odo=1.00m — bed frame 1m from victim).
+                    #   Pure odometry <= 0.20m handles flat/non-solid victims like victim3
+                    #   where IR never detects the body at all (fl=1.21, fr=2.00 at scoring).
+                    ir_contact = (fl < 0.10 or fr < 0.10)
+                    at_victim = (ir_contact and dist_to_target < 0.60) or dist_to_target <= 0.20
 
                     if at_victim:
                         self.hardware.set_motor_speeds(0.0, 0.0)
@@ -1262,13 +1262,11 @@ class AutonomousSARController:
                                 self.state = "STOP"
                         continue
 
-                    # Still approaching: slow creep directly toward victim,
-                    # avoidance disabled (sensors might see victim body).
-                    # Angle correction only (no IR avoidance).
-                    v_direct, omega_direct = self.pursuit.get_velocity(
-                        pose, target, 2.0, 2.0, None, dist_to_goal=dist_to_target)
-                    self.hardware.set_motor_speeds(v_direct, omega_direct)
-                    continue  # Skip stuck detection and collision recovery
+                    # A* path continues to guide correct approach angle toward victim.
+                    # Do NOT override with direct drive here — for victims under furniture
+                    # (e.g. victim1 under bed) the planned path navigates around the obstacle
+                    # to reach the victim from the correct gap. Direct drive at 1.5m would
+                    # go straight into the bed frame. Fall through to normal path following.
 
                 # ==========================================================
                 # STUCK DETECTION WATCHDOG
@@ -1319,7 +1317,7 @@ class AutonomousSARController:
                 # Triggers when robot is physically pressed against a wall.
                 # SKIP when close to the victim target.
                 # ==========================================================
-                if (fl < 0.10 or fr < 0.10) and dist_to_target > 1.5 and self.post_score_cooldown <= 0:
+                if ((fl < 0.07 or fr < 0.07) or (fl < 0.10 and fr < 0.10)) and dist_to_target > 1.5 and self.post_score_cooldown <= 0:
                     # Check for recovery loop: too many recoveries in a short time
                     if self.tick_counter - self.last_recovery_tick < 60:
                         self.recovery_count += 1
